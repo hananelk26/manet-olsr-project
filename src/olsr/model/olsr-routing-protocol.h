@@ -2,6 +2,9 @@
  * Copyright (c) 2004 Francisco J. Ros
  * Copyright (c) 2007 INESC Porto
  *
+ *
+ * Modified by: Oded Ofek, 2025 - Implementation of Blackhole & Link Spoofing Attacks
+ *
  * SPDX-License-Identifier: GPL-2.0-only
  *
  * Authors: Francisco J. Ros  <fjrm@dif.um.es>
@@ -27,9 +30,17 @@
 #include "ns3/test.h"
 #include "ns3/timer.h"
 #include "ns3/traced-callback.h"
+#include "ns3/wifi-phy.h"
+#include "ns3/wifi-mac-header.h"
+#include "ns3/wifi-net-device.h"
+#include "ns3/wifi-mac.h"
+#include "ns3/wifi-mpdu.h"
+
+#include "olsr-defense-strategy.h"
 
 #include <map>
 #include <vector>
+#include <set>
 
 /// Testcase for MPR computation mechanism
 class OlsrMprTestCase;
@@ -86,6 +97,18 @@ class RoutingProtocol : public Ipv4RoutingProtocol
      */
     static TypeId GetTypeId();
 
+    /**
+     * \brief Get list of blacklisted nodes from defense strategy.
+     * \return Set of blacklisted IP addresses.
+     */
+    std::set<Ipv4Address> GetBlacklist() const;
+
+    /**
+    * \brief Get the main address of this node.
+    * \return The main OLSR address.
+    */
+    Ipv4Address GetMainAddress() const { return m_mainAddress; }
+    
     RoutingProtocol();
     ~RoutingProtocol() override;
 
@@ -254,6 +277,52 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     OlsrState m_state; //!< Internal state with all needed data structs.
     Ptr<Ipv4> m_ipv4;  //!< IPv4 object the routing is linked to.
 
+    // ======================================================================
+    // SECURITY RESEARCH EXTENSION: Malicious Behavior Configuration
+    // ======================================================================
+
+    /**
+     * @brief Flag to enable malicious behavior (Blackhole Attack).
+     *
+     * When set to true, the node will:
+     * 1. Advertise willingness = 7 (WILL_ALWAYS) to attract traffic.
+     * 2. Manipulate ANSN in TC messages to poison topology tables.
+     * 3. Drop data packets instead of forwarding them (Sinkhole).
+     */
+    bool m_isMalicious;
+
+    /**
+     * @brief Number of fake links to advertise (Link Spoofing Attack).
+     *
+     * Defines how many non-existent symmetric neighbors the node should
+     * advertise in its HELLO messages to increase its apparent centrality.
+     * Default is 0 (disabled).
+     */
+    uint32_t m_spoofedLinksCount;
+
+    // ======================================================================
+
+
+    // ======================================================================
+    // SECURITY RESEARCH EXTENSION: Defense Strategy Interface
+    // ======================================================================
+    /**
+    * @brief Pointer to the active Defense Strategy (Strategy Pattern).
+    *
+    * This object decouples security logic from the routing protocol.
+    * It handles:
+    * 1. Malicious Node Detection (IsMalicious).
+    * 2. Traffic Monitoring (OnRecvHello, OnRecvTc).
+    * 3. Trust Updates (OnPacketSent, OnPacketDrop).
+    *
+    * Configurable via the "DefenseStrategy" attribute.
+    */
+    Ptr<OlsrDefenseStrategy> m_defenseStrategy;
+
+    void MacTxDrop(std::string context, ns3::WifiMacDropReason reason, ns3::Ptr<const ns3::WifiMpdu> mpdu);
+
+    // ======================================================================
+    
     /**
      * @brief Clears the routing table and frees the memory assigned to each one of its entries.
      */
@@ -353,7 +422,33 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     void NotifyInterfaceDown(uint32_t interface) override;
     void NotifyAddAddress(uint32_t interface, Ipv4InterfaceAddress address) override;
     void NotifyRemoveAddress(uint32_t interface, Ipv4InterfaceAddress address) override;
+    // ======================================================================
+    // SECURITY RESEARCH EXTENSION: 
+    // ======================================================================
+    void ProcessPromiscPacket (Ptr<const Packet> packet);
 
+    void HandleDefenseTimer();
+    Timer m_defenseTimer;
+
+    /**
+   * \brief Trace callback to sniff neighbor traffic at the PHY layer.
+   * Matches signature: ns3::WifiPhy::MonitorSnifferRxCallback
+   */
+  void MonitorSnifferRx (Ptr<const Packet> packet, 
+                         uint16_t channelFreqMhz, 
+                         WifiTxVector txVector, 
+                         MpduInfo aMpdu, 
+                         SignalNoiseDbm signalNoise, 
+                         uint16_t staId);
+
+    /**
+    * \brief Helper to attach the sniffer to the WifiPhy.
+    */
+    void SetupPromiscuousMonitor ();
+
+    /// Flag to ensure we only attach the monitor once
+    bool m_monitorSetupDone;
+    // ======================================================================
     /**
      * Send an OLSR message.
      * @param packet The packet to be sent.
@@ -826,6 +921,25 @@ class RoutingProtocol : public Ipv4RoutingProtocol
 
     /// Provides uniform random variables.
     Ptr<UniformRandomVariable> m_uniformRandomVariable;
+
+    // ======================================================================
+    // SECURITY RESEARCH EXTENSION: Self-Reliability & Cross Layer
+    // ======================================================================
+    
+    /**
+     * Counter for local physical layer reception failures (collisions/noise).
+     * Used to determine if "my" watchdog observations are reliable.
+     */
+    uint32_t m_localRxDrops;
+
+    /**
+     * Trace callback for PhyRxDrop.
+     * @param packet The dropped packet.
+     * @param reason The reason for the drop.
+     */
+    void OnLocalRxDrop (Ptr<const Packet> packet, ns3::WifiPhyRxfailureReason reason);
+    
+    // ======================================================================
 };
 
 } // namespace olsr

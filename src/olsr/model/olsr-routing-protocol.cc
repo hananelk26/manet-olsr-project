@@ -1,12 +1,3 @@
-/*
- * Copyright (c) 2004 Francisco J. Ros
- * Copyright (c) 2007 INESC Porto
- *
- * SPDX-License-Identifier: GPL-2.0-only
- *
- * Authors: Francisco J. Ros  <fjrm@dif.um.es>
- *          Gustavo J. A. M. Carneiro <gjc@inescporto.pt>
- */
 
 ///
 /// @brief Implementation of OLSR agent and related classes.
@@ -40,9 +31,26 @@
 #include "ns3/trace-source-accessor.h"
 #include "ns3/udp-socket-factory.h"
 #include "ns3/uinteger.h"
+#include "ns3/pointer.h"
+#include "ns3/ipv4-l3-protocol.h"
+#include "ns3/ipv4-interface.h"
+#include "ns3/arp-cache.h"
+#include "ns3/wifi-net-device.h"
+#include "ns3/wifi-mac.h"
+#include "ns3/wifi-mpdu.h"
+#include "ns3/llc-snap-header.h"
+#include "ns3/pointer.h"
+#include "ns3/node.h"
+#include "ns3/queue-disc.h"
+#include "ns3/traffic-control-layer.h"
+#include "ns3/energy-source-container.h"
+#include "ns3/energy-source.h"
+#include "ns3/config.h"
 
 #include <iomanip>
 #include <iostream>
+
+
 
 /********** Useful macros **********/
 
@@ -220,6 +228,26 @@ RoutingProtocol::GetTypeId()
                                           "high",
                                           Willingness::ALWAYS,
                                           "always"))
+            // ======================================================================
+            // SECURITY RESEARCH EXTENSION: Attributes
+            // ======================================================================
+            .AddAttribute ("IsMalicious",
+                            "Flag to enable Blackhole attack behavior. If true, the node will drop data packets and manipulate routing messages.",
+                            BooleanValue (false), // Default value is benign (false)
+                            MakeBooleanAccessor (&RoutingProtocol::m_isMalicious),
+                            MakeBooleanChecker ())
+            .AddAttribute ("SpoofedLinksCount",
+                            "Number of fake symmetric links to advertise in HELLO messages (Link Spoofing).",
+                            UintegerValue (0),    // Default value is 0 (disabled)
+                            MakeUintegerAccessor (&RoutingProtocol::m_spoofedLinksCount),
+                            MakeUintegerChecker<uint32_t> ())
+            .AddAttribute ("DefenseStrategy",
+                        "The security defense mechanism to use.",
+                        PointerValue (),
+                        MakePointerAccessor (&RoutingProtocol::m_defenseStrategy), 
+                        MakePointerChecker<OlsrDefenseStrategy> ()) 
+            // ======================================================================
+
             .AddTraceSource("Rx",
                             "Receive OLSR packet.",
                             MakeTraceSourceAccessor(&RoutingProtocol::m_rxPacketTrace),
@@ -238,11 +266,18 @@ RoutingProtocol::GetTypeId()
 RoutingProtocol::RoutingProtocol()
     : m_routingTableAssociation(nullptr),
       m_ipv4(nullptr),
+      // SECURITY RESEARCH EXTENSION: Initialize malicious flags
+      m_isMalicious(false),
+      m_spoofedLinksCount(0),
+      // FIX: Initialize m_defenseTimer here (matching declaration order in .h)
+      m_defenseTimer(Timer::CANCEL_ON_DESTROY),
+      m_monitorSetupDone (false),
       m_helloTimer(Timer::CANCEL_ON_DESTROY),
       m_tcTimer(Timer::CANCEL_ON_DESTROY),
       m_midTimer(Timer::CANCEL_ON_DESTROY),
       m_hnaTimer(Timer::CANCEL_ON_DESTROY),
-      m_queuedMessagesTimer(Timer::CANCEL_ON_DESTROY)
+      m_queuedMessagesTimer(Timer::CANCEL_ON_DESTROY),
+      m_localRxDrops (0) // new line
 {
     m_uniformRandomVariable = CreateObject<UniformRandomVariable>();
 
@@ -279,6 +314,16 @@ RoutingProtocol::SetIpv4(Ptr<Ipv4> ipv4)
 void
 RoutingProtocol::DoDispose()
 {
+
+    if (m_defenseStrategy)
+    {
+        m_defenseStrategy->DoDispose();
+        m_defenseStrategy = nullptr;
+    }
+
+
+    m_defenseTimer.Cancel();
+
     m_ipv4 = nullptr;
     m_hnaRoutingTable = nullptr;
     m_routingTableAssociation = nullptr;
@@ -361,7 +406,6 @@ RoutingProtocol::DoInitialize()
         Ipv4Address loopback("127.0.0.1");
         for (uint32_t i = 0; i < m_ipv4->GetNInterfaces(); i++)
         {
-            // Use primary address, if multiple
             Ipv4Address addr = m_ipv4->GetAddress(i, 0).GetLocal();
             if (addr != loopback)
             {
@@ -369,7 +413,6 @@ RoutingProtocol::DoInitialize()
                 break;
             }
         }
-
         NS_ASSERT(m_mainAddress != Ipv4Address());
     }
 
@@ -388,9 +431,6 @@ RoutingProtocol::DoInitialize()
 
         if (addr != m_mainAddress)
         {
-            // Create never expiring interface association tuple entries for our
-            // own network interfaces, so that GetMainAddress () works to
-            // translate the node's own interface addresses into the main address.
             IfaceAssocTuple tuple;
             tuple.ifaceAddr = addr;
             tuple.mainAddr = m_mainAddress;
@@ -403,7 +443,6 @@ RoutingProtocol::DoInitialize()
             continue;
         }
 
-        // Create a socket to listen on all the interfaces
         if (!m_recvSocket)
         {
             m_recvSocket = Socket::CreateSocket(GetObject<Node>(), UdpSocketFactory::GetTypeId());
@@ -418,7 +457,6 @@ RoutingProtocol::DoInitialize()
             m_recvSocket->ShutdownSend();
         }
 
-        // Create a socket to send packets from this specific interfaces
         Ptr<Socket> socket = Socket::CreateSocket(GetObject<Node>(), UdpSocketFactory::GetTypeId());
         socket->SetAllowBroadcast(true);
         socket->SetIpTtl(1);
@@ -435,6 +473,53 @@ RoutingProtocol::DoInitialize()
         canRunOlsr = true;
     }
 
+    // ======================================================================
+    // SECURITY RESEARCH EXTENSION: NEW Monitor Mode Hook
+    // ======================================================================
+    // We call this ONCE, outside the loop, as it iterates devices internally.
+    if (!m_monitorSetupDone)
+    {
+        SetupPromiscuousMonitor();
+        m_monitorSetupDone = true;
+    }
+    // ======================================================================
+
+    // ======================================================================
+    // SECURITY RESEARCH EXTENSION: Defense Initialization
+    // ======================================================================
+    if (m_defenseStrategy)
+    {
+        m_defenseStrategy->Setup(this, m_mainAddress);
+        m_defenseTimer.SetFunction(&RoutingProtocol::HandleDefenseTimer, this);
+        m_defenseTimer.Schedule(Seconds(1.0));
+    }
+    // ======================================================================
+
+    // ======================================================================
+    // SECURITY RESEARCH EXTENSION: Force RTS/CTS
+    // This sets the RtsCtsThreshold to 0 for all Wifi devices on this node.
+    // Required for Algorithm 1 (tracking RTS/CTS exchange for all packets).
+    // ======================================================================
+    if (m_ipv4)
+    {
+        Ptr<Node> node = m_ipv4->GetObject<Node>();
+        if (node)
+        {
+            for (uint32_t i = 0; i < node->GetNDevices(); i++)
+            {
+                Ptr<WifiNetDevice> wifiDev = DynamicCast<WifiNetDevice>(node->GetDevice(i));
+                if (wifiDev)
+                {
+                    Ptr<WifiRemoteStationManager> manager = wifiDev->GetRemoteStationManager();
+                    if (manager)
+                    {
+                        manager->SetAttribute("RtsCtsThreshold", UintegerValue(0));
+                    }
+                }
+            }
+        }
+    }
+
     if (canRunOlsr)
     {
         HelloTimerExpire();
@@ -443,6 +528,16 @@ RoutingProtocol::DoInitialize()
         HnaTimerExpire();
 
         NS_LOG_DEBUG("OLSR on node " << m_mainAddress << " started");
+    }
+
+    if (m_ipv4)
+    {
+        ns3::Ptr<ns3::Node> node = m_ipv4->GetObject<ns3::Node>();
+        if (node)
+        {
+            std::string tracePath = "/NodeList/" + std::to_string(node->GetId()) + "/DeviceList/*/$ns3::WifiNetDevice/Mac/DroppedMpdu";
+            ns3::Config::Connect(tracePath, ns3::MakeCallback(&RoutingProtocol::MacTxDrop, this));
+        }
     }
 }
 
@@ -532,9 +627,7 @@ RoutingProtocol::RecvOlsr(Ptr<Socket> socket)
     for (auto messageIter = messages.begin(); messageIter != messages.end(); messageIter++)
     {
         const MessageHeader& messageHeader = *messageIter;
-        // If ttl is less than or equal to zero, or
-        // the receiver is the same as the originator,
-        // the message must be silently dropped
+
         if (messageHeader.GetTimeToLive() == 0 ||
             messageHeader.GetOriginatorAddress() == m_mainAddress)
         {
@@ -543,22 +636,45 @@ RoutingProtocol::RecvOlsr(Ptr<Socket> socket)
             continue;
         }
 
-        // If the message has been processed it must not be processed again
+        // FIX: HOOKS MOVED HERE (Before Filtering)
+        // This ensures the Defense Strategy sees ALL traffic:
+        // 1. Malicious traffic (before we drop it)
+        // 2. Duplicate traffic (before the protocol ignores it)
+        if (m_defenseStrategy)
+        {
+            switch (messageHeader.GetMessageType())
+            {
+            case olsr::MessageHeader::HELLO_MESSAGE:
+                m_defenseStrategy->OnRecvHello(senderIfaceAddr, packet, messageHeader, messageHeader.GetHello());
+                break;
+            case olsr::MessageHeader::TC_MESSAGE:
+                m_defenseStrategy->OnRecvTc(senderIfaceAddr, packet, messageHeader, messageHeader.GetTc());
+                break;
+            default:
+                break; 
+            }
+        }
+
+        // ======================================================================
+        // SECURITY RESEARCH EXTENSION: Malicious Node Filtering
+        // ======================================================================
+        if (m_defenseStrategy)
+        {
+            Ipv4Address senderMainAddr = GetMainAddress(senderIfaceAddr);
+            if (m_defenseStrategy->IsMalicious (messageHeader.GetOriginatorAddress ()) ||
+                m_defenseStrategy->IsMalicious (senderMainAddr))
+            {
+                NS_LOG_LOGIC ("SECURITY: Dropping OLSR message. Originator: " 
+                              << messageHeader.GetOriginatorAddress () 
+                              << ", Sender: " << senderMainAddr);
+                continue; 
+            }
+        }
+
         bool do_forwarding = true;
         DuplicateTuple* duplicated =
             m_state.FindDuplicateTuple(messageHeader.GetOriginatorAddress(),
                                        messageHeader.GetMessageSequenceNumber());
-
-        // Get main address of the peer, which may be different from the packet source address
-        //       const IfaceAssocTuple *ifaceAssoc = m_state.FindIfaceAssocTuple
-        //       (inetSourceAddr.GetIpv4 ()); Ipv4Address peerMainAddress; if (ifaceAssoc != NULL)
-        //         {
-        //           peerMainAddress = ifaceAssoc->mainAddr;
-        //         }
-        //       else
-        //         {
-        //           peerMainAddress = inetSourceAddr.GetIpv4 () ;
-        //         }
 
         if (duplicated == nullptr)
         {
@@ -599,9 +715,6 @@ RoutingProtocol::RecvOlsr(Ptr<Socket> socket)
         else
         {
             NS_LOG_DEBUG("OLSR message is duplicated, not reading it.");
-
-            // If the message has been considered for forwarding, it should
-            // not be retransmitted again
             for (auto it = duplicated->ifaceList.begin(); it != duplicated->ifaceList.end(); it++)
             {
                 if (*it == receiverIfaceAddr)
@@ -614,9 +727,6 @@ RoutingProtocol::RecvOlsr(Ptr<Socket> socket)
 
         if (do_forwarding)
         {
-            // HELLO messages are never forwarded.
-            // TC and MID messages are forwarded using the default algorithm.
-            // Remaining messages are also forwarded using the default algorithm.
             if (messageHeader.GetMessageType() != olsr::MessageHeader::HELLO_MESSAGE)
             {
                 ForwardDefault(messageHeader,
@@ -707,11 +817,14 @@ RoutingProtocol::MprComputation()
     // N is the subset of neighbors of the node, which are
     // neighbor "of the interface I"
     NeighborSet N;
-    for (auto neighbor = m_state.GetNeighbors().begin(); neighbor != m_state.GetNeighbors().end();
-         neighbor++)
+    for (auto neighbor = m_state.GetNeighbors().begin(); neighbor != m_state.GetNeighbors().end(); neighbor++)
     {
-        if (neighbor->status == NeighborTuple::STATUS_SYM) // I think that we need this check
+        if (neighbor->status == NeighborTuple::STATUS_SYM)
         {
+            if (m_defenseStrategy && m_defenseStrategy->IsMalicious (neighbor->neighborMainAddr))
+            {
+                continue; 
+            }
             N.push_back(*neighbor);
         }
     }
@@ -727,15 +840,16 @@ RoutingProtocol::MprComputation()
          twoHopNeigh != m_state.GetTwoHopNeighbors().end();
          twoHopNeigh++)
     {
-        // excluding:
-        // (ii)  the node performing the computation
+        if (m_defenseStrategy && m_defenseStrategy->IsMalicious (twoHopNeigh->neighborMainAddr))
+        {
+            continue; 
+        }
+
         if (twoHopNeigh->twoHopNeighborAddr == m_mainAddress)
         {
             continue;
         }
 
-        //  excluding:
-        // (i)   the nodes only reachable by members of N with willingness Willingness::NEVER
         bool ok = false;
         for (auto neigh = N.begin(); neigh != N.end(); neigh++)
         {
@@ -750,9 +864,6 @@ RoutingProtocol::MprComputation()
             continue;
         }
 
-        // excluding:
-        // (iii) all the symmetric neighbors: the nodes for which there exists a symmetric
-        //       link to this node on some interface.
         for (auto neigh = N.begin(); neigh != N.end(); neigh++)
         {
             if (neigh->neighborMainAddr == twoHopNeigh->twoHopNeighborAddr)
@@ -1005,6 +1116,16 @@ RoutingProtocol::RoutingTableComputation()
     const NeighborSet& neighborSet = m_state.GetNeighbors();
     for (auto it = neighborSet.begin(); it != neighborSet.end(); it++)
     {
+        // ======================================================================
+        // SECURITY RESEARCH EXTENSION
+        // ======================================================================
+        if (m_defenseStrategy && m_defenseStrategy->IsMalicious (it->neighborMainAddr))
+        {
+            NS_LOG_LOGIC ("RoutingTableComputation: Skipping malicious neighbor " << it->neighborMainAddr);
+            continue; 
+        }
+
+
         const NeighborTuple& nb_tuple = *it;
         NS_LOG_DEBUG("Looking at neighbor tuple: " << nb_tuple);
         if (nb_tuple.status == NeighborTuple::STATUS_SYM)
@@ -1148,6 +1269,12 @@ RoutingProtocol::RoutingTableComputation()
         for (auto it = topology.begin(); it != topology.end(); it++)
         {
             const TopologyTuple& topology_tuple = *it;
+
+            if (m_defenseStrategy && m_defenseStrategy->IsMalicious (topology_tuple.lastAddr))
+            {
+                continue;
+            }
+
             NS_LOG_LOGIC("Looking at topology tuple: " << topology_tuple);
 
             RoutingTableEntry destAddrEntry;
@@ -1230,6 +1357,11 @@ RoutingProtocol::RoutingTableComputation()
     for (auto it = associationSet.begin(); it != associationSet.end(); it++)
     {
         const AssociationTuple& tuple = *it;
+
+        if (m_defenseStrategy && m_defenseStrategy->IsMalicious (tuple.gatewayAddr))
+        {
+            continue;
+        }
 
         // Test if HNA associations received from other gateways
         // are also announced by this node. In such a case, no route
@@ -1719,7 +1851,20 @@ RoutingProtocol::SendHello()
     olsr::MessageHeader::Hello& hello = msg.GetHello();
 
     hello.SetHTime(m_helloInterval);
-    hello.willingness = m_willingness;
+    
+    // ======================================================================
+    // SECURITY RESEARCH EXTENSION: Willingness Manipulation
+    // ======================================================================
+    if (m_isMalicious)
+    {
+        // FIX 2: Direct access to member variable (no Setter method in this version)
+        hello.willingness = Willingness::ALWAYS;
+    }
+    else
+    {
+        hello.willingness = m_willingness;
+    }
+    // ======================================================================
 
     std::vector<olsr::MessageHeader::Hello::LinkMessage>& linkMessages = hello.linkMessages;
 
@@ -1808,6 +1953,55 @@ RoutingProtocol::SendHello()
 
         linkMessages.push_back(linkMessage);
     }
+
+    // ======================================================================
+    // SECURITY RESEARCH EXTENSION: Link Spoofing
+    // ======================================================================
+    if (m_isMalicious && m_spoofedLinksCount > 0)
+    {
+        olsr::MessageHeader::Hello::LinkMessage spoofedMsg;
+
+        // Construct LinkCode implying a Symmetric Link and Symmetric Neighbor.
+        // This combination (SYM_LINK + SYM_NEIGH) is the strongest bond in OLSR,
+        // making the node highly attractive for routing paths.
+        spoofedMsg.linkCode = (static_cast<uint8_t>(LinkType::SYM_LINK) & 0x03) |
+                              ((static_cast<uint8_t>(NeighborType::SYM_NEIGH) << 2) & 0x0f);
+
+        for (uint32_t k = 0; k < m_spoofedLinksCount; ++k)
+        {
+            // Generate deterministic fake IP addresses starting from 200.0.0.1 (0xC8000001).
+            // These addresses do not correspond to real nodes, creating a "Blackhole" effect
+            // if traffic is routed towards them via this node.
+            Ipv4Address fakeIp(0xC8000001 + k); 
+            spoofedMsg.neighborInterfaceAddresses.push_back(fakeIp);
+        }
+
+        linkMessages.push_back(spoofedMsg);
+    }
+    // ======================================================================
+
+    // ======================================================================
+    // SECURITY RESEARCH EXTENSION: Fictitious Node Injection (GCOP/GCOHP)
+    // ======================================================================
+    if (m_defenseStrategy != nullptr && m_defenseStrategy->RequiresFictitiousNode())
+    {
+        olsr::MessageHeader::Hello::LinkMessage fakeLinkMsg;
+
+        // Construct LinkCode implying a Symmetric Link and Symmetric Neighbor.
+        fakeLinkMsg.linkCode = (static_cast<uint8_t>(LinkType::SYM_LINK) & 0x03) |
+                               ((static_cast<uint8_t>(NeighborType::SYM_NEIGH) << 2) & 0x0f);
+
+        // Generate a fake IP address unique to this node (MainIP + 65536)
+        uint32_t fakeIpNum = m_mainAddress.Get() + 65536;
+        Ipv4Address fakeAddress(fakeIpNum);
+        
+        fakeLinkMsg.neighborInterfaceAddresses.push_back(fakeAddress);
+        linkMessages.push_back(fakeLinkMsg);
+        
+        NS_LOG_INFO("Injected fictitious node " << fakeAddress << " into HELLO message as required by defense strategy.");
+    }
+    // ======================================================================
+
     NS_LOG_DEBUG("OLSR HELLO message size: " << int(msg.GetSerializedSize()) << " (with "
                                              << int(linkMessages.size()) << " link messages)");
     QueueMessage(msg, JITTER);
@@ -1827,7 +2021,20 @@ RoutingProtocol::SendTc()
     msg.SetMessageSequenceNumber(GetMessageSequenceNumber());
 
     olsr::MessageHeader::Tc& tc = msg.GetTc();
-    tc.ansn = m_ansn;
+
+    // ======================================================================
+    // SECURITY RESEARCH EXTENSION: Topology Poisoning (ANSN Manipulation)
+    // ======================================================================
+    if (m_isMalicious)
+    {
+        // Artificially increase the ANSN (Advertised Neighbor Sequence Number).
+        // Adding a large offset (200) ensures this update is treated as "newer"
+        // than legitimate updates by other nodes (Sequence Number Arithmetic).
+        m_ansn = (m_ansn + 200) % OLSR_MAX_SEQ_NUM;
+    }
+    // ======================================================================
+
+    tc.ansn = m_ansn; // <--- The packet now gets the poisoned value here
 
     for (auto mprsel_tuple = m_state.GetMprSelectors().begin();
          mprsel_tuple != m_state.GetMprSelectors().end();
@@ -1835,6 +2042,22 @@ RoutingProtocol::SendTc()
     {
         tc.neighborAddresses.push_back(mprsel_tuple->mainAddr);
     }
+
+    // ======================================================================
+    // SECURITY RESEARCH EXTENSION: Self-Topology Monitoring (Ground Truth)
+    // ======================================================================
+    /**
+    * Notify the Defense Strategy about the TC message being generated.
+    * This establishes the "ground truth" of what this node is advertising
+    * to the network, capturing any malicious manipulations (like ANSN poisoning)
+    * before random queuing jitter is introduced.
+    */
+    if (m_defenseStrategy)
+    {
+        m_defenseStrategy->OnTcGenerated(tc);
+    }
+    // ======================================================================
+
     QueueMessage(msg, JITTER);
 }
 
@@ -2902,6 +3125,15 @@ RoutingProtocol::RouteOutput(Ptr<Packet> p,
         rtentry->SetSource(ifAddr.GetLocal());
         rtentry->SetGateway(entry2.nextAddr);
         rtentry->SetOutputDevice(m_ipv4->GetNetDevice(interfaceIdx));
+        // ======================================================================
+        // SECURITY RESEARCH EXTENSION: 
+        // ======================================================================
+        if (m_defenseStrategy)
+        {
+            m_defenseStrategy->OnDataPacketForwarded (p, entry2.nextAddr, header.GetDestination());
+        }
+
+
         sockerr = Socket::ERROR_NOTERROR;
         NS_LOG_DEBUG("Olsr node " << m_mainAddress << ": RouteOutput for dest="
                                   << header.GetDestination() << " --> nextHop=" << entry2.nextAddr
@@ -2919,6 +3151,13 @@ RoutingProtocol::RouteOutput(Ptr<Packet> p,
         if (rtentry)
         {
             found = true;
+            
+            // FIX: Add missing hook for HNA (Gateway) routes
+            if (m_defenseStrategy)
+            {
+                m_defenseStrategy->OnDataPacketForwarded(p, rtentry->GetGateway(), header.GetDestination());
+            }
+
             NS_LOG_DEBUG("Found route to " << rtentry->GetDestination() << " via nh "
                                            << rtentry->GetGateway() << " with source addr "
                                            << rtentry->GetSource() << " and output dev "
@@ -2969,18 +3208,26 @@ RoutingProtocol::RouteInput(Ptr<const Packet> p,
         }
         else
         {
-            // The local delivery callback is null.  This may be a multicast
-            // or broadcast packet, so return false so that another
-            // multicast routing protocol can handle it.  It should be possible
-            // to extend this to explicitly check whether it is a unicast
-            // packet, and invoke the error callback if so
             NS_LOG_LOGIC("Null local delivery callback");
             return false;
         }
     }
 
+
     NS_LOG_LOGIC("Forward packet");
     // Forwarding
+
+    // ======================================================================
+    // SECURITY RESEARCH EXTENSION: Blackhole Attack (Data Plane)
+    // ======================================================================
+    if (m_isMalicious)
+    {
+        NS_LOG_WARN("MALICIOUS: Blackhole node " << m_mainAddress 
+                    << " dropped packet destined to " << dst);
+        return true; 
+    }
+    // ======================================================================
+
     Ptr<Ipv4Route> rtentry;
     RoutingTableEntry entry1;
     RoutingTableEntry entry2;
@@ -2991,6 +3238,13 @@ RoutingProtocol::RouteInput(Ptr<const Packet> p,
         {
             NS_FATAL_ERROR("FindSendEntry failure");
         }
+
+        if (m_defenseStrategy)
+        {
+            m_defenseStrategy->OnDataPacketReceived(p, origin, dst, entry2.nextAddr);
+        }
+
+
         rtentry = Create<Ipv4Route>();
         rtentry->SetDestination(header.GetDestination());
         uint32_t interfaceIdx = entry2.interface;
@@ -3018,6 +3272,36 @@ RoutingProtocol::RouteInput(Ptr<const Packet> p,
                                   << header.GetDestination() << " --> nextHop=" << entry2.nextAddr
                                   << " interface=" << entry2.interface);
 
+        
+        // =========================================================
+        // DATA PLANE DEFENSE (IMP MECHANISM ENFORCEMENT) for gcop defense
+        // =========================================================
+        // Check if the next hop is in the malicious blacklist
+        if (m_defenseStrategy && m_defenseStrategy->IsMalicious(entry2.nextAddr))
+        {
+            NS_LOG_WARN("IMP Action: Next hop " << entry2.nextAddr << " is identified as malicious! Dropping packet to prevent Blackhole.");
+            
+            // Notify the defense strategy that a drop occurred due to security reasons
+            m_defenseStrategy->OnDataPacketDropped(p, origin, entry2.nextAddr, DROP_NO_ROUTE);
+            
+            // Trigger standard NS-3 drop mechanisms via Error Callback
+            ecb(p, header, Socket::ERROR_NOROUTETOHOST);
+            return true; // Return true to indicate the packet was handled (dropped)
+        }
+        // =========================================================
+
+
+        // ======================================================================
+        // SECURITY RESEARCH EXTENSION: Forwarding Trust Monitor
+        // ======================================================================
+        // We only count this as a "Send" if we are NOT malicious (checked above)
+        // and we actually found a route.
+        if (m_defenseStrategy)
+        {
+            m_defenseStrategy->OnDataPacketForwarded (p, entry2.nextAddr, header.GetDestination());
+        }
+        // ======================================================================
+        
         ucb(rtentry, p, header);
         return true;
     }
@@ -3044,7 +3328,17 @@ RoutingProtocol::RouteInput(Ptr<const Packet> p,
 
             NS_LOG_DEBUG("** Routing table dump end.");
 #endif // NS3_LOG_ENABLE
-
+	
+            // ======================================================================
+            // SECURITY RESEARCH EXTENSION: Drop Event Monitor
+            // ======================================================================
+            // The packet is being dropped because no route was found.
+            if (m_defenseStrategy)
+            {
+                // Change: Pass 'origin' and use DROP_NO_ROUTE enum
+                m_defenseStrategy->OnDataPacketDropped (p, origin, dst, DROP_NO_ROUTE);
+            }
+            // ======================================================================
             return false;
         }
     }
@@ -3220,6 +3514,201 @@ Ptr<const Ipv4StaticRouting>
 RoutingProtocol::GetRoutingTableAssociation() const
 {
     return m_hnaRoutingTable;
+}
+
+std::set<Ipv4Address>
+RoutingProtocol::GetBlacklist() const
+{
+    NS_LOG_FUNCTION(this);
+    if (m_defenseStrategy)
+    {
+        return m_defenseStrategy->GetBlacklist();
+    }
+    return std::set<Ipv4Address>();
+}
+
+void
+RoutingProtocol::MacTxDrop(std::string context, ns3::WifiMacDropReason reason, ns3::Ptr<const ns3::WifiMpdu> mpdu)
+{
+    if (reason != ns3::WIFI_MAC_DROP_REACHED_RETRY_LIMIT)
+    {
+        return;
+    }
+    if (!m_defenseStrategy)
+    {
+        return;
+    }
+    ns3::Ptr<const ns3::Packet> originalPacket = mpdu->GetPacket();
+    if (!originalPacket)
+    {
+        return;
+    }
+    ns3::Ptr<ns3::Packet> packetCopy = originalPacket->Copy();
+    ns3::LlcSnapHeader llc;
+    if (packetCopy->GetSize() < llc.GetSerializedSize())
+    {
+        return;
+    }
+    packetCopy->RemoveHeader(llc);
+    if (llc.GetType() != ns3::Ipv4L3Protocol::PROT_NUMBER)
+    {
+        return;
+    }
+    ns3::Ipv4Header ipHeader;
+    if (packetCopy->GetSize() < ipHeader.GetSerializedSize())
+    {
+        return;
+    }
+    packetCopy->PeekHeader(ipHeader);
+    ns3::Ipv4Address neighbor = ipHeader.GetDestination();
+    m_defenseStrategy->OnMacTxFailure(neighbor, 1);
+}
+
+// ======================================================================
+// SECURITY RESEARCH EXTENSION: Cross-Layer Implementation
+// ======================================================================
+
+void
+RoutingProtocol::HandleDefenseTimer()
+{
+    if (m_defenseStrategy)
+    {
+        // 1. Run the periodic strategy logic (clean blacklist, verify pending packets)
+        m_defenseStrategy->PeriodicCheck();
+        
+        // 2. Report local noise level (Algorithm B: Self-Reliability Check)
+        // This tells the strategy if "we" are reliable enough to judge others.
+        m_defenseStrategy->OnSelfReliabilityReport(m_localRxDrops);
+        m_localRxDrops = 0; // Reset counter for the next interval
+
+        // 3. Queue & Energy Monitoring (Original Logic)
+        Ptr<Node> node = GetObject<Node>();
+        if (node)
+        {
+            // --- Queue Status Logic (Congestion Detection) ---
+            uint32_t nDevices = node->GetNDevices();
+            for (uint32_t i = 0; i < nDevices; ++i)
+            {
+                Ptr<NetDevice> dev = node->GetDevice(i);
+                if (!dev) continue;
+
+                Ptr<WifiNetDevice> wifiDev = dev->GetObject<WifiNetDevice>();
+                if (!wifiDev) continue;
+
+                Ptr<TrafficControlLayer> tc = node->GetObject<TrafficControlLayer>();
+                if (!tc) continue;
+
+                Ptr<QueueDisc> qd = tc->GetRootQueueDiscOnDevice(dev);
+                if (!qd) continue;
+
+                uint32_t qSize = qd->GetNPackets();
+                uint32_t qCap = qd->GetMaxSize().GetValue();
+
+                m_defenseStrategy->OnQueueStatusReport(qSize, qCap);
+                break; // Assuming monitoring the first WiFi device is enough
+            }
+
+            // --- Energy Status Logic (Battery Depletion Detection) ---
+            Ptr<ns3::energy::EnergySourceContainer> esContainer = node->GetObject<ns3::energy::EnergySourceContainer>();
+            if (esContainer && esContainer->GetN() > 0)
+            {
+                Ptr<ns3::energy::EnergySource> source = esContainer->Get(0);
+                if (source)
+                {
+                    double remaining = source->GetRemainingEnergy();
+                    double initial = source->GetInitialEnergy();
+                    double fraction = 0.0;
+
+                    if (initial > 0.0)
+                    {
+                        fraction = remaining / initial;
+                    }
+
+                    m_defenseStrategy->OnEnergyStateUpdate(remaining, fraction);
+                }
+            }
+        }
+
+        // Schedule the next check in 1 second
+        m_defenseTimer.Schedule(Seconds(1.0));
+    }
+}
+
+void
+RoutingProtocol::OnLocalRxDrop (Ptr<const Packet> packet, ns3::WifiPhyRxfailureReason reason)
+{
+    // Increment counter for every local PHY drop (collision/noise)
+    m_localRxDrops++;
+}
+
+void
+RoutingProtocol::MonitorSnifferRx (Ptr<const Packet> packet, uint16_t channelFreqMhz, WifiTxVector txVector, MpduInfo aMpdu, SignalNoiseDbm signalNoise, uint16_t staId)
+{
+    if (!m_defenseStrategy) return;
+
+    WifiMacHeader wifiHdr;
+    if (!packet->PeekHeader (wifiHdr)) return;
+
+    // --- CASE 1: Data Packets (Watchdog Monitoring) ---
+    if (wifiHdr.IsData())
+    {
+        Mac48Address transmitter = wifiHdr.GetAddr2 ();
+        Mac48Address receiver = wifiHdr.GetAddr1 ();
+        
+        Ptr<Packet> packetCopy = packet->Copy ();
+        packetCopy->RemoveHeader (wifiHdr);
+        
+        LlcSnapHeader llc;
+        if (packetCopy->PeekHeader (llc)) { packetCopy->RemoveHeader (llc); }
+
+        Ipv4Header ipHeader;
+        if (packetCopy->GetSize() >= ipHeader.GetSerializedSize() && packetCopy->PeekHeader(ipHeader))
+        {
+            m_defenseStrategy->OnNeighborForwardedPacket (transmitter, receiver, packetCopy);
+        }
+    }
+    // --- CASE 2: Control Packets (Algorithm 1: RTS/CTS Monitoring) ---
+    else if (wifiHdr.IsCtl())
+    {
+        Mac48Address receiver = wifiHdr.GetAddr1 ();
+        
+        if (wifiHdr.IsRts())
+        {
+             // For RTS: Addr2 is the Transmitter (Sender)
+             Mac48Address transmitter = wifiHdr.GetAddr2 ();
+             m_defenseStrategy->OnRtsReceived(transmitter, receiver);
+        }
+        else if (wifiHdr.IsCts())
+        {
+             // For CTS: Addr1 is the Receiver (The node that sent the RTS).
+             // The "Sender" of CTS is implicit (it's the destination of the RTS).
+             m_defenseStrategy->OnCtsReceived(receiver); 
+        }
+    }
+}
+
+void
+RoutingProtocol::SetupPromiscuousMonitor ()
+{
+    NS_ASSERT (m_ipv4 != nullptr);
+    Ptr<Node> node = m_ipv4->GetObject<Node> ();
+    for (uint32_t i = 0; i < node->GetNDevices (); ++i)
+    {
+        Ptr<NetDevice> dev = node->GetDevice (i);
+        Ptr<WifiNetDevice> wifiDev = DynamicCast<WifiNetDevice> (dev);
+        if (wifiDev)
+        {
+            Ptr<WifiPhy> phy = wifiDev->GetPhy ();
+            if (phy)
+            {
+                // Hook 1: Promiscuous Sniffer (Watchdog + RTS/CTS)
+                phy->TraceConnectWithoutContext ("MonitorSnifferRx", MakeCallback (&RoutingProtocol::MonitorSnifferRx, this));
+                
+                // Hook 2: Local Drop Monitor (Self-Reliability / Algorithm B)
+                phy->TraceConnectWithoutContext ("PhyRxDrop", MakeCallback (&RoutingProtocol::OnLocalRxDrop, this));
+            }
+        }
+    }
 }
 
 } // namespace olsr
