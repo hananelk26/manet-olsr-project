@@ -50,3 +50,9 @@ vcpkg/
 
 # Ignore local cache used by e.g. clangd
 .cache/
+
+# Simulation Output Files
+*.xml
+
+# Windows/WSL Download Artifacts
+*:Zone.Identifier
