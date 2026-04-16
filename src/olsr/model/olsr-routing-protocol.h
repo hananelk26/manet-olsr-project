@@ -194,6 +194,18 @@ class RoutingProtocol : public Ipv4RoutingProtocol
      */
     typedef void (*TableChangeTracedCallback)(uint32_t size);
 
+    // ======================================================================
+    // SECURITY RESEARCH EXTENSION: Defense Strategy Reactivation
+    // Added to support mid-simulation defense toggling in test scenarios.
+    // DoInitialize() runs only once at Simulator::Run(); this function
+    // allows re-triggering Setup() and the defense timer at any point.
+    // ======================================================================
+
+    void ReactivateDefenseStrategy();
+
+    // ======================================================================
+
+
   private:
     std::set<uint32_t> m_interfaceExclusions; //!< Set of interfaces excluded by OSLR.
     Ptr<Ipv4StaticRouting>

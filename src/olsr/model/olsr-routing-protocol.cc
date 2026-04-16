@@ -1102,6 +1102,23 @@ RoutingProtocol::GetMainAddress(Ipv4Address iface_addr) const
     }
 }
 
+// ======================================================================
+// SECURITY RESEARCH EXTENSION: Defense Strategy Reactivation
+// Added to support mid-simulation defense toggling in test scenarios.
+// DoInitialize() runs only once at Simulator::Run(); this function
+// allows re-triggering Setup() and the defense timer at any point.
+// ======================================================================
+void RoutingProtocol::ReactivateDefenseStrategy()
+{
+    if (!m_defenseStrategy) return;
+    m_defenseStrategy->Setup(this, m_mainAddress);
+    if (!m_defenseTimer.IsRunning()) {
+        m_defenseTimer.SetFunction(&RoutingProtocol::HandleDefenseTimer, this);
+        m_defenseTimer.Schedule(Seconds(1.0));
+    }
+}
+// ======================================================================
+
 void
 RoutingProtocol::RoutingTableComputation()
 {
