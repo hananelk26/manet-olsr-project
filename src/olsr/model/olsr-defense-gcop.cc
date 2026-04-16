@@ -447,6 +447,17 @@ bool OlsrDefenseGcop::RunGcohpAlgorithm() {
                     return true;
                 }
             }
+
+            for (const auto& blueCloser : blues) {
+                if (blueCloser == edge1.second || blueCloser == edge2.second) continue;
+                if (graph[edge1.second].count(blueCloser) &&
+                    graph[edge2.second].count(blueCloser) &&
+                    !graph[edge1.first].count(blueCloser) &&   // (g', b) ∉ E3
+                    !graph[edge2.first].count(blueCloser)) {   // (g'', b) ∉ E3
+                    NS_LOG_INFO("GCOHP: 6-node cycle (blue closing) detected.");
+                    return true;
+                }
+            }
         }
     }
     return false;
