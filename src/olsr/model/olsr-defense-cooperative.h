@@ -4,6 +4,7 @@
 #include "olsr-defense-strategy.h"
 #include "ns3/nstime.h"
 #include "ns3/simulator.h"
+#include "ns3/timer.h" 
 #include <map>
 #include <vector>
 
@@ -91,6 +92,8 @@ private:
   struct MacObservation {
       uint32_t rtsCount;          // How many RTS B sent to C
       bool hasClearance;          // Did C send CTS to B?
+      Time firstSeen;             // Time of first observation in the current window
+      Time lastUpdated;            // Time of the most recent update
   };
 
   // Map: PacketUID -> Packet Info (A -> B)
@@ -132,6 +135,68 @@ private:
    * Decreases suspicion scores over time to forgive temporary congestion issues.
    */
   void ApplyDecay();
+
+  /**
+   * \brief Tracks the most recent RTS target for each sender.
+   * Used to correctly attribute CTS frames (which only carry Addr1=sender of RTS).
+   * Key: sender MAC (who sent RTS) → Value: receiver MAC (to whom RTS was sent)
+   */
+  std::map<Mac48Address, Mac48Address> m_lastRtsTarget;
+  
+  /**
+   * \brief Cached MAC address of this node (resolved lazily).
+   */
+  Mac48Address m_myMac;
+
+  /**
+   * \brief Helper to resolve this node's own MAC address (lazy initialization).
+   */
+  Mac48Address GetMyMac();
+
+  /**
+   * \brief Resolves the MAC address of a neighbor given its IP address.
+   * Searches through all Ipv4Interface ARP caches on this node.
+   * \param ip The IPv4 address of the neighbor.
+   * \return The Mac48Address if found, or a default-constructed (invalid) one otherwise.
+   */
+  Mac48Address GetMacForIp(Ipv4Address ip);
+
+  /**
+   * \brief Private timer for fast watchdog evaluation.
+   * Runs independently of the main defense timer (which stays at 1s),
+   * allowing this strategy to evaluate pending packets at its own pace.
+   */
+  Timer m_watchdogTimer;
+  
+  /**
+   * \brief Interval between internal watchdog evaluations.
+   * Should be ≤ m_watchdogTimeout for timely pending-packet checks.
+   */
+  Time m_watchdogCheckInterval;
+  
+  /**
+   * \brief Internal evaluator — the logic that used to live in PeriodicCheck.
+   * Called by m_watchdogTimer on its own schedule.
+   */
+  void EvaluatePendingPackets();
+
+  /**
+   * \brief Tracks forwarding activity for each neighbor (by MAC address).
+   * Used to distinguish a true silent blackhole (activity=0) from a
+   * congested-but-honest node (activity>0). 
+   * 
+   * Key: neighbor MAC address
+   * Value: number of data packets we overheard this neighbor transmit
+   *        in the current observation window.
+   */
+  std::map<Mac48Address, uint32_t> m_neighborActivity;
+  
+  /**
+   * \brief Minimum activity count required to consider a neighbor "alive/busy"
+   * rather than silently dropping. If activity >= this threshold, silent-drop
+   * classification is suppressed (charitable interpretation: congestion).
+   */
+  static const uint32_t ACTIVITY_THRESHOLD = 2;
 
 };
 

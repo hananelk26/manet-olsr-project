@@ -77,6 +77,10 @@ private:
 
     RoutingProtocol* m_routingProtocol;        //!< Pointer to the core OLSR routing protocol.
     Ipv4Address m_mainAddress;                 //!< Main IPv4 address of this node.
+
+    double m_startTime; 
+
+    bool HasKnownMaliciousNeighbor();
     
     /**
      * \brief Data structure to track suspicious nodes.
