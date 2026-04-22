@@ -744,7 +744,7 @@ void OlsrDefenseCooperative::ReportMalicious(Ipv4Address suspect)
         // and recompute routing table so subsequent traffic bypasses this node.
         if (m_protocol)
         {
-            m_protocol->EvictNeighbor(suspect);
+            //m_protocol->EvictNeighbor(suspect);
         }
     }
 }

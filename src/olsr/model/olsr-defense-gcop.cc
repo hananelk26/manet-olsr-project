@@ -420,7 +420,7 @@ void OlsrDefenseGcop::EvaluateContradictionRules(Ipv4Address senderAddress) {
     if (isRisky) {
         // Penalty slightly longer than HELLO interval (2s) + jitter.
         // 5s ensures that a repeating attacker stays flagged continuously.
-        m_suspiciousNodes[senderAddress] = Simulator::Now() + Seconds(10.0);
+        m_suspiciousNodes[senderAddress] = Simulator::Now() + Seconds(5.0);
         NS_LOG_WARN("Node " << m_mainAddress << " flagged " << senderAddress
                     << " as MALICIOUS. Reason: " << violationReason);
     } else {
