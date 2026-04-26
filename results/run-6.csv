@@ -1,0 +1,6 @@
+Phase,Tx,Rx,PDR_pct,AvgDelayMs,ThroughputKbps,NodesDetectingAtk1,NodesDetectingAtk2,NodesDetectingAny,NodesDetectingBoth,NodesWithFalsePositives,TotalFalsePositives,Atk1FlaggedSomewhere,Atk2FlaggedSomewhere,BackupWronglyFlagged
+baseline,3910,3908,99.95,18.08,422.06,0,0,0,0,0,0,0,0,0
+attack_only,3900,780,20.00,10.92,84.24,0,0,0,0,0,0,0,0,0
+defense_only,3895,3895,100.00,18.17,420.66,0,0,0,0,0,0,0,0,0
+defense_vs_attack,3900,3903,100.08,19.36,421.52,7,7,7,7,0,0,1,1,0
+baseline_late,3895,3895,100.00,18.12,420.66,0,0,0,0,0,0,0,0,0

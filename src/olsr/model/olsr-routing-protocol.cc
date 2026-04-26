@@ -271,13 +271,11 @@ RoutingProtocol::RoutingProtocol()
       m_spoofedLinksCount(0),
       // FIX: Initialize m_defenseTimer here (matching declaration order in .h)
       m_defenseTimer(Timer::CANCEL_ON_DESTROY),
-      m_monitorSetupDone (false),
       m_helloTimer(Timer::CANCEL_ON_DESTROY),
       m_tcTimer(Timer::CANCEL_ON_DESTROY),
       m_midTimer(Timer::CANCEL_ON_DESTROY),
       m_hnaTimer(Timer::CANCEL_ON_DESTROY),
-      m_queuedMessagesTimer(Timer::CANCEL_ON_DESTROY),
-      m_localRxDrops (0) // new line
+      m_queuedMessagesTimer(Timer::CANCEL_ON_DESTROY)
 {
     m_uniformRandomVariable = CreateObject<UniformRandomVariable>();
 
@@ -472,17 +470,6 @@ RoutingProtocol::DoInitialize()
 
         canRunOlsr = true;
     }
-
-    // ======================================================================
-    // SECURITY RESEARCH EXTENSION: NEW Monitor Mode Hook
-    // ======================================================================
-    // We call this ONCE, outside the loop, as it iterates devices internally.
-    if (!m_monitorSetupDone)
-    {
-        SetupPromiscuousMonitor();
-        m_monitorSetupDone = true;
-    }
-    // ======================================================================
 
     // ======================================================================
     // SECURITY RESEARCH EXTENSION: Defense Initialization
@@ -1997,28 +1984,6 @@ RoutingProtocol::SendHello()
     }
     // ======================================================================
 
-    // ======================================================================
-    // SECURITY RESEARCH EXTENSION: Fictitious Node Injection (GCOP/GCOHP)
-    // ======================================================================
-    if (m_defenseStrategy != nullptr && m_defenseStrategy->RequiresFictitiousNode())
-    {
-        olsr::MessageHeader::Hello::LinkMessage fakeLinkMsg;
-
-        // Construct LinkCode implying a Symmetric Link and Symmetric Neighbor.
-        fakeLinkMsg.linkCode = (static_cast<uint8_t>(LinkType::SYM_LINK) & 0x03) |
-                               ((static_cast<uint8_t>(NeighborType::SYM_NEIGH) << 2) & 0x0f);
-
-        // Generate a fake IP address unique to this node (MainIP + 65536)
-        uint32_t fakeIpNum = m_mainAddress.Get() + 65536;
-        Ipv4Address fakeAddress(fakeIpNum);
-        
-        fakeLinkMsg.neighborInterfaceAddresses.push_back(fakeAddress);
-        linkMessages.push_back(fakeLinkMsg);
-        
-        NS_LOG_INFO("Injected fictitious node " << fakeAddress << " into HELLO message as required by defense strategy.");
-    }
-    // ======================================================================
-
     NS_LOG_DEBUG("OLSR HELLO message size: " << int(msg.GetSerializedSize()) << " (with "
                                              << int(linkMessages.size()) << " link messages)");
     QueueMessage(msg, JITTER);
@@ -3289,24 +3254,6 @@ RoutingProtocol::RouteInput(Ptr<const Packet> p,
                                   << header.GetDestination() << " --> nextHop=" << entry2.nextAddr
                                   << " interface=" << entry2.interface);
 
-        
-        // =========================================================
-        // DATA PLANE DEFENSE (IMP MECHANISM ENFORCEMENT) for gcop defense
-        // =========================================================
-        // Check if the next hop is in the malicious blacklist
-        if (m_defenseStrategy && m_defenseStrategy->IsMalicious(entry2.nextAddr))
-        {
-            NS_LOG_WARN("IMP Action: Next hop " << entry2.nextAddr << " is identified as malicious! Dropping packet to prevent Blackhole.");
-            
-            // Notify the defense strategy that a drop occurred due to security reasons
-            m_defenseStrategy->OnDataPacketDropped(p, origin, entry2.nextAddr, DROP_NO_ROUTE);
-            
-            // Trigger standard NS-3 drop mechanisms via Error Callback
-            ecb(p, header, Socket::ERROR_NOROUTETOHOST);
-            return true; // Return true to indicate the packet was handled (dropped)
-        }
-        // =========================================================
-
 
         // ======================================================================
         // SECURITY RESEARCH EXTENSION: Forwarding Trust Monitor
@@ -3588,144 +3535,7 @@ RoutingProtocol::MacTxDrop(std::string context, ns3::WifiMacDropReason reason, n
 void
 RoutingProtocol::HandleDefenseTimer()
 {
-    if (m_defenseStrategy)
-    {
-        // 1. Run the periodic strategy logic (clean blacklist, verify pending packets)
-        m_defenseStrategy->PeriodicCheck();
-        
-        // 2. Report local noise level (Algorithm B: Self-Reliability Check)
-        // This tells the strategy if "we" are reliable enough to judge others.
-        m_defenseStrategy->OnSelfReliabilityReport(m_localRxDrops);
-        m_localRxDrops = 0; // Reset counter for the next interval
-
-        // 3. Queue & Energy Monitoring (Original Logic)
-        Ptr<Node> node = GetObject<Node>();
-        if (node)
-        {
-            // --- Queue Status Logic (Congestion Detection) ---
-            uint32_t nDevices = node->GetNDevices();
-            for (uint32_t i = 0; i < nDevices; ++i)
-            {
-                Ptr<NetDevice> dev = node->GetDevice(i);
-                if (!dev) continue;
-
-                Ptr<WifiNetDevice> wifiDev = dev->GetObject<WifiNetDevice>();
-                if (!wifiDev) continue;
-
-                Ptr<TrafficControlLayer> tc = node->GetObject<TrafficControlLayer>();
-                if (!tc) continue;
-
-                Ptr<QueueDisc> qd = tc->GetRootQueueDiscOnDevice(dev);
-                if (!qd) continue;
-
-                uint32_t qSize = qd->GetNPackets();
-                uint32_t qCap = qd->GetMaxSize().GetValue();
-
-                m_defenseStrategy->OnQueueStatusReport(qSize, qCap);
-                break; // Assuming monitoring the first WiFi device is enough
-            }
-
-            // --- Energy Status Logic (Battery Depletion Detection) ---
-            Ptr<ns3::energy::EnergySourceContainer> esContainer = node->GetObject<ns3::energy::EnergySourceContainer>();
-            if (esContainer && esContainer->GetN() > 0)
-            {
-                Ptr<ns3::energy::EnergySource> source = esContainer->Get(0);
-                if (source)
-                {
-                    double remaining = source->GetRemainingEnergy();
-                    double initial = source->GetInitialEnergy();
-                    double fraction = 0.0;
-
-                    if (initial > 0.0)
-                    {
-                        fraction = remaining / initial;
-                    }
-
-                    m_defenseStrategy->OnEnergyStateUpdate(remaining, fraction);
-                }
-            }
-        }
-
-        // Schedule the next check in 1 second
-        m_defenseTimer.Schedule(Seconds(1.0));
-    }
-}
-
-void
-RoutingProtocol::OnLocalRxDrop (Ptr<const Packet> packet, ns3::WifiPhyRxfailureReason reason)
-{
-    // Increment counter for every local PHY drop (collision/noise)
-    m_localRxDrops++;
-}
-
-void
-RoutingProtocol::MonitorSnifferRx (Ptr<const Packet> packet, uint16_t channelFreqMhz, WifiTxVector txVector, MpduInfo aMpdu, SignalNoiseDbm signalNoise, uint16_t staId)
-{
-    if (!m_defenseStrategy) return;
-
-    WifiMacHeader wifiHdr;
-    if (!packet->PeekHeader (wifiHdr)) return;
-
-    // --- CASE 1: Data Packets (Watchdog Monitoring) ---
-    if (wifiHdr.IsData())
-    {
-        Mac48Address transmitter = wifiHdr.GetAddr2 ();
-        Mac48Address receiver = wifiHdr.GetAddr1 ();
-        
-        Ptr<Packet> packetCopy = packet->Copy ();
-        packetCopy->RemoveHeader (wifiHdr);
-        
-        LlcSnapHeader llc;
-        if (packetCopy->PeekHeader (llc)) { packetCopy->RemoveHeader (llc); }
-
-        Ipv4Header ipHeader;
-        if (packetCopy->GetSize() >= ipHeader.GetSerializedSize() && packetCopy->PeekHeader(ipHeader))
-        {
-            m_defenseStrategy->OnNeighborForwardedPacket (transmitter, receiver, packetCopy);
-        }
-    }
-    // --- CASE 2: Control Packets (Algorithm 1: RTS/CTS Monitoring) ---
-    else if (wifiHdr.IsCtl())
-    {
-        Mac48Address receiver = wifiHdr.GetAddr1 ();
-        
-        if (wifiHdr.IsRts())
-        {
-             // For RTS: Addr2 is the Transmitter (Sender)
-             Mac48Address transmitter = wifiHdr.GetAddr2 ();
-             m_defenseStrategy->OnRtsReceived(transmitter, receiver);
-        }
-        else if (wifiHdr.IsCts())
-        {
-             // For CTS: Addr1 is the Receiver (The node that sent the RTS).
-             // The "Sender" of CTS is implicit (it's the destination of the RTS).
-             m_defenseStrategy->OnCtsReceived(receiver); 
-        }
-    }
-}
-
-void
-RoutingProtocol::SetupPromiscuousMonitor ()
-{
-    NS_ASSERT (m_ipv4 != nullptr);
-    Ptr<Node> node = m_ipv4->GetObject<Node> ();
-    for (uint32_t i = 0; i < node->GetNDevices (); ++i)
-    {
-        Ptr<NetDevice> dev = node->GetDevice (i);
-        Ptr<WifiNetDevice> wifiDev = DynamicCast<WifiNetDevice> (dev);
-        if (wifiDev)
-        {
-            Ptr<WifiPhy> phy = wifiDev->GetPhy ();
-            if (phy)
-            {
-                // Hook 1: Promiscuous Sniffer (Watchdog + RTS/CTS)
-                phy->TraceConnectWithoutContext ("MonitorSnifferRx", MakeCallback (&RoutingProtocol::MonitorSnifferRx, this));
-                
-                // Hook 2: Local Drop Monitor (Self-Reliability / Algorithm B)
-                phy->TraceConnectWithoutContext ("PhyRxDrop", MakeCallback (&RoutingProtocol::OnLocalRxDrop, this));
-            }
-        }
-    }
+   
 }
 
 } // namespace olsr

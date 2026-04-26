@@ -7,8 +7,8 @@ build_lib(
     model/olsr-state.cc
     # --- New Security Files ---
     model/olsr-defense-strategy.cc
-    model/olsr-defense-cooperative.cc
     model/olsr-defense-gcop.cc
+    model/olsr-watchdog-defense.cc
 
   HEADER_FILES
     helper/olsr-helper.h
@@ -18,8 +18,8 @@ build_lib(
     model/olsr-state.h
     # --- New Security Headers ---
     model/olsr-defense-strategy.h
-    model/olsr-defense-cooperative.h
     model/olsr-defense-gcop.h
+    model/olsr-watchdog-defense.h
 
   LIBRARIES_TO_LINK 
     ${libinternet}
