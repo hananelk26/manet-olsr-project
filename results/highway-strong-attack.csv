@@ -1,0 +1,5 @@
+seed_used,num_nodes,area_length,area_width,range,num_attackers,attackers,spoof_count,forward_timeout_s,periodic_interval_s,warmup_duration_s,blacklist_threshold,rts_to_data_ratio_thresh,self_drops_threshold,mac_failure_threshold,min_rts_for_heuristic,min_self_reliability,phase_idx,phase_name,attack_on,defense_on,tx_packets,rx_packets,rx_bytes,throughput_mbps,pdr_percent,avg_delay_s
+1,50,1000,200,300,5,5|15|25|35|45,15,0.5,1,15,10,3,5,3,5,0.3,1,"Baseline",0,0,3750,3715,2006100,0.401220,99.0667,0.021728
+1,50,1000.000000,200.000000,300.000000,5,5|15|25|35|45,15,0.500000,1.000000,15.000000,10,3.000000,5,3,5,0.300000,2,"Attack only",1,0,3750,3745,2022300,0.404460,99.8667,0.011592
+1,50,1000.000000,200.000000,300.000000,5,5|15|25|35|45,15,0.500000,1.000000,15.000000,10,3.000000,5,3,5,0.300000,3,"Defense only",0,1,3722,3715,2006100,0.401220,99.8119,0.014917
+1,50,1000.000000,200.000000,300.000000,5,5|15|25|35|45,15,0.500000,1.000000,15.000000,10,3.000000,5,3,5,0.300000,4,"Attack + Defense",1,1,3619,3133,1691820,0.338364,86.5709,0.019775
