@@ -1,0 +1,5 @@
+Phase,Tx,Rx,PDR_pct,AvgDelayMs,NodesWithSuspects,AttackerFlaggedAtVictim,VictimRouteNextHop,VictimRouteDistance
+baseline,18,18,100.00,3.76,0,0,10.0.0.3 [ATTACKER],2
+attack_only,18,0,0.00,0.00,0,0,10.0.0.3 [ATTACKER],2
+defense_only,16,10,62.50,7.93,4,0,no-route,0
+defense_vs_attack,5,0,0.00,0.00,7,1,10.0.0.5,3
