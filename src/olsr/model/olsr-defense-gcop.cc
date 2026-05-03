@@ -34,6 +34,7 @@ void OlsrDefenseGcop::Setup(RoutingProtocol* proto, Ipv4Address nodeAddress) {
 
 void OlsrDefenseGcop::DoDispose() {
     m_suspiciousNodes.clear();
+    m_violationCounter.clear();
     m_routingProtocol = nullptr;
 }
 
@@ -90,14 +91,15 @@ void OlsrDefenseGcop::OnRecvHello(Ipv4Address senderAddress,
     EvaluateContradictionRules(senderAddress); 
 }
 
-void OlsrDefenseGcop::OnDataPacketReceived(Ptr<const Packet> packet, Ipv4Address source, Ipv4Address destination, Ipv4Address prevHop) {
-    // Optional: Log received data packets from suspicious nodes
-    if (IsMalicious(prevHop)) {
-        NS_LOG_INFO("Warning: Received data packet from a currently suspicious node " << prevHop);
+void OlsrDefenseGcop::OnDataPacketReceived(Ptr<const Packet> packet, Ipv4Address source, Ipv4Address destination, Ipv4Address nextHop) {
+    // Log if we're about to forward to a node we currently consider malicious.
+    // (The actual drop happens in RouteInput via the IMP enforcement check.)
+    if (IsMalicious(nextHop)) {
+        NS_LOG_INFO("About to forward packet via suspicious next-hop " << nextHop);
     }
 }
 
-void OlsrDefenseGcop::OnDataPacketForwarded(Ptr<const Packet> packet, Ipv4Address source, Ipv4Address nextHop) {
+void OlsrDefenseGcop::OnDataPacketForwarded(Ptr<const Packet> packet, Ipv4Address nextHop, Ipv4Address finalDest) {
     // This hook allows us to log if IMP is actively bypassing or catching a routing attempt
     if (IsMalicious(nextHop)) {
         NS_LOG_WARN("IMP Mechanism triggered! Intercepted attempt to forward packet to malicious Next-Hop " << nextHop);
@@ -295,7 +297,7 @@ void OlsrDefenseGcop::EvaluateContradictionRules(Ipv4Address senderAddress) {
     // Wait for network convergence before starting to evaluate.
     // OLSR HELLO interval = 2s, TC interval = 5s. 45s gives enough time for
     // routing tables and topology sets to stabilize across the network.
-    if (Simulator::Now().GetSeconds() < m_startTime + 45.0)
+    if (Simulator::Now().GetSeconds() < 45.0)
         return;
 
     // If sender is already flagged, no need to re-evaluate (preserves the
@@ -416,20 +418,53 @@ void OlsrDefenseGcop::EvaluateContradictionRules(Ipv4Address senderAddress) {
 
     // ------------------------------------------------------------------------
     // Apply or remove penalty based on evaluation result
+    //
+    // CONFIRMATION POLICY: A node is added to the blacklist only after 2
+    // CONSECUTIVE violations. This filters out one-shot false positives
+    // (e.g., a transient MAC-layer asymmetric view due to HELLO packet
+    // loss) while still catching real attackers within ~4 seconds.
+    //
+    // Real attacker behavior:
+    //   t=0:   sends malicious HELLO -> violation #1, counter=1, NOT blacklisted
+    //   t=2:   sends malicious HELLO -> violation #2, counter=2, BLACKLISTED
+    //   t=2-7: blacklist holds (penalty=5s, refreshed by next HELLO)
+    //
+    // False-positive behavior:
+    //   t=0:   transient asymmetry -> violation #1, counter=1, NOT blacklisted
+    //   t=2:   normal HELLO -> isRisky=false, counter RESET to 0
+    //   No blacklist applied. Legitimate route preserved.
     // ------------------------------------------------------------------------
     if (isRisky) {
-        // Penalty slightly longer than HELLO interval (2s) + jitter.
-        // 5s ensures that a repeating attacker stays flagged continuously.
-        m_suspiciousNodes[senderAddress] = Simulator::Now() + Seconds(5.0);
-        NS_LOG_WARN("Node " << m_mainAddress << " flagged " << senderAddress
-                    << " as MALICIOUS. Reason: " << violationReason);
+        m_violationCounter[senderAddress]++;
+
+        if (m_violationCounter[senderAddress] >= 2) {
+            // Confirmed: 2 consecutive violations -> apply penalty.
+            // Penalty 5s: long enough to keep a true attacker flagged across
+            // HELLO cycles, and gets refreshed every 2s by each new violation.
+            m_suspiciousNodes[senderAddress] = Simulator::Now() + Seconds(5.0);
+            NS_LOG_WARN("Node " << m_mainAddress << " flagged " << senderAddress
+                        << " as MALICIOUS (violation #"
+                        << m_violationCounter[senderAddress]
+                        << "). Reason: " << violationReason);
+        } else {
+            // First-time observation: do not blacklist yet, wait for confirmation.
+            NS_LOG_INFO("Node " << m_mainAddress << " observed first violation by "
+                        << senderAddress << ". Reason: " << violationReason
+                        << " (waiting for second violation before blacklisting)");
+        }
     } else {
-        // Passed all checks: if previously suspicious, clear the flag.
+        // Passed all checks: clear blacklist entry AND reset counter.
+        // Resetting the counter is the key to filtering false positives:
+        // a legitimate node that had one bad HELLO will NOT be blacklisted
+        // because its counter resets on the next clean HELLO.
         auto it = m_suspiciousNodes.find(senderAddress);
         if (it != m_suspiciousNodes.end()) {
             m_suspiciousNodes.erase(it);
             NS_LOG_INFO("Node " << senderAddress
                         << " cleared from suspicious list (passed checks).");
+        }
+        if (m_violationCounter.count(senderAddress)) {
+            m_violationCounter[senderAddress] = 0;
         }
     }
 }

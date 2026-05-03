@@ -39,8 +39,8 @@ public:
     virtual bool RequiresFictitiousNode() override;
 
     // --- Data Plane Hooks ---
-    virtual void OnDataPacketReceived(Ptr<const Packet> packet, Ipv4Address source, Ipv4Address destination, Ipv4Address prevHop) override;
-    virtual void OnDataPacketForwarded(Ptr<const Packet> packet, Ipv4Address source, Ipv4Address nextHop) override;
+    virtual void OnDataPacketReceived(Ptr<const Packet> packet, Ipv4Address source, Ipv4Address destination, Ipv4Address nextHop) override;
+    virtual void OnDataPacketForwarded(Ptr<const Packet> packet, Ipv4Address nextHop, Ipv4Address finalDest) override;
 
     // --- Unused Interface Methods (Empty Implementations) ---
     virtual void OnRecvTc(Ipv4Address senderIfaceAddr, Ptr<const Packet> packet, const MessageHeader& msg, const MessageHeader::Tc& tc) override {}
@@ -87,6 +87,18 @@ private:
      * Maps an IPv4 address to the timestamp indicating until when it is considered suspicious.
      */
     std::map<Ipv4Address, Time> m_suspiciousNodes; 
+
+    /**
+     * \brief Tracks the number of consecutive rule violations per neighbor.
+     * A node is added to the blacklist only after 2 consecutive violations,
+     * which prevents transient one-shot false positives (e.g., a temporary
+     * MAC-layer asymmetric link view caused by HELLO packet loss) from
+     * incorrectly blacklisting legitimate nodes.
+     * 
+     * The counter is incremented on every isRisky=true evaluation, and
+     * RESET to 0 on every isRisky=false evaluation.
+     */
+    std::map<Ipv4Address, uint32_t> m_violationCounter;
 };
 
 } // namespace olsr

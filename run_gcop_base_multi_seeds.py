@@ -578,7 +578,7 @@ def main():
                     help="Maximum total seeds to try")
     ap.add_argument("--start-seed", type=int, default=1)
     ap.add_argument("--output-csv", default=None)
-    ap.add_argument("--extra-args", default="",
+    ap.add_argument("--extra-args", default="--spoofedLinks=3",
                     help='Extra args forwarded verbatim, e.g. --extra-args "--spoofedLinks=2"')
     ap.add_argument("--timeout", type=int, default=900,
                     help="Per-run timeout in seconds")
