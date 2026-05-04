@@ -437,29 +437,10 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     // ======================================================================
     // SECURITY RESEARCH EXTENSION: 
     // ======================================================================
-    void ProcessPromiscPacket (Ptr<const Packet> packet);
 
     void HandleDefenseTimer();
     Timer m_defenseTimer;
-
-    /**
-   * \brief Trace callback to sniff neighbor traffic at the PHY layer.
-   * Matches signature: ns3::WifiPhy::MonitorSnifferRxCallback
-   */
-  void MonitorSnifferRx (Ptr<const Packet> packet, 
-                         uint16_t channelFreqMhz, 
-                         WifiTxVector txVector, 
-                         MpduInfo aMpdu, 
-                         SignalNoiseDbm signalNoise, 
-                         uint16_t staId);
-
-    /**
-    * \brief Helper to attach the sniffer to the WifiPhy.
-    */
-    void SetupPromiscuousMonitor ();
-
-    /// Flag to ensure we only attach the monitor once
-    bool m_monitorSetupDone;
+    
     // ======================================================================
     /**
      * Send an OLSR message.
@@ -934,24 +915,7 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     /// Provides uniform random variables.
     Ptr<UniformRandomVariable> m_uniformRandomVariable;
 
-    // ======================================================================
-    // SECURITY RESEARCH EXTENSION: Self-Reliability & Cross Layer
-    // ======================================================================
     
-    /**
-     * Counter for local physical layer reception failures (collisions/noise).
-     * Used to determine if "my" watchdog observations are reliable.
-     */
-    uint32_t m_localRxDrops;
-
-    /**
-     * Trace callback for PhyRxDrop.
-     * @param packet The dropped packet.
-     * @param reason The reason for the drop.
-     */
-    void OnLocalRxDrop (Ptr<const Packet> packet, ns3::WifiPhyRxfailureReason reason);
-    
-    // ======================================================================
 };
 
 } // namespace olsr
