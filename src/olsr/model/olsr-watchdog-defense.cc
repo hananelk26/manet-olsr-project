@@ -70,7 +70,7 @@ OlsrWatchdogDefense::GetTypeId()
                       "forward contributes 1 unit; the RTS-without-DATA "
                       "heuristic contributes 2. Higher values trade off "
                       "detection speed for false-positive resistance.",
-                      UintegerValue(10),
+                      UintegerValue(3),
                       MakeUintegerAccessor(&OlsrWatchdogDefense::m_blacklistThreshold),
                       MakeUintegerChecker<uint32_t>())
         .AddAttribute("RtsToDataRatioThreshold",
@@ -101,7 +101,7 @@ OlsrWatchdogDefense::GetTypeId()
         .AddAttribute("MinSelfReliability",
                       "Floor value for self-reliability score; prevents it "
                       "from dropping so low that detection becomes impossible.",
-                      DoubleValue(0.3),
+                      DoubleValue(0.6),
                       MakeDoubleAccessor(&OlsrWatchdogDefense::m_minSelfReliability),
                       MakeDoubleChecker<double>(0.01, 1.0))
         .AddAttribute("ProbationDuration",
@@ -109,7 +109,7 @@ OlsrWatchdogDefense::GetTypeId()
                       "the neighbor enters probation for this duration. Only if "
                       "misbehavior persists beyond probation does blacklisting "
                       "commit. Filters out transient burst losses.",
-                      TimeValue(Seconds(10.0)),
+                      TimeValue(Seconds(2.0)),
                       MakeTimeAccessor(&OlsrWatchdogDefense::m_probationDuration),
                       MakeTimeChecker())
         .AddAttribute("MacFailureRateThreshold",
@@ -126,7 +126,7 @@ OlsrWatchdogDefense::GetTypeId()
                       "for blacklisting. Distinguishes 'silent neighbor' "
                       "(may be out of range / link-broken) from 'misbehaving "
                       "neighbor' (forwards some traffic but drops ours).",
-                      UintegerValue(3),
+                      UintegerValue(2),
                       MakeUintegerAccessor(&OlsrWatchdogDefense::m_minDataObservations),
                       MakeUintegerChecker<uint32_t>())
         .AddAttribute("Enabled",
@@ -570,6 +570,9 @@ OlsrWatchdogDefense::OnNeighborForwardedPacket(Mac48Address transmitter,
                                                 Mac48Address /*receiver*/,
                                                 Ptr<const Packet> packet)
 {
+    if (!m_enabled) return;
+    if (!packet) return;
+
     Ipv4Address txIp = LookupIpFromMac(transmitter);
     if (txIp == Ipv4Address())
     {
@@ -593,7 +596,6 @@ OlsrWatchdogDefense::OnNeighborForwardedPacket(Mac48Address transmitter,
     {
         if (pp->packetUid == uid)
         {
-            // The neighbor did forward: clear evidence and count success.
             vec.erase(pp);
             s.packetsForwarded++;
             NS_LOG_DEBUG(m_mainAddress << " observed " << txIp

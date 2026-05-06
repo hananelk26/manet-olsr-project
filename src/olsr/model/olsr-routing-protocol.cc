@@ -3492,40 +3492,56 @@ RoutingProtocol::GetBlacklist() const
 }
 
 void
-RoutingProtocol::MacTxDrop(std::string context, ns3::WifiMacDropReason reason, ns3::Ptr<const ns3::WifiMpdu> mpdu)
+RoutingProtocol::MacTxDrop(std::string context,
+                           ns3::WifiMacDropReason reason,
+                           ns3::Ptr<const ns3::WifiMpdu> mpdu)
 {
-    if (reason != ns3::WIFI_MAC_DROP_REACHED_RETRY_LIMIT)
-    {
-        return;
-    }
-    if (!m_defenseStrategy)
-    {
-        return;
-    }
+    if (reason != ns3::WIFI_MAC_DROP_REACHED_RETRY_LIMIT) return;
+    if (!m_defenseStrategy) return;
+    if (!mpdu) return;
+
+    // ----- Read the IP final destination from the dropped MPDU -----
     ns3::Ptr<const ns3::Packet> originalPacket = mpdu->GetPacket();
-    if (!originalPacket)
-    {
-        return;
-    }
+    if (!originalPacket) return;
+
     ns3::Ptr<ns3::Packet> packetCopy = originalPacket->Copy();
     ns3::LlcSnapHeader llc;
-    if (packetCopy->GetSize() < llc.GetSerializedSize())
-    {
-        return;
-    }
+    if (packetCopy->GetSize() < llc.GetSerializedSize()) return;
     packetCopy->RemoveHeader(llc);
-    if (llc.GetType() != ns3::Ipv4L3Protocol::PROT_NUMBER)
-    {
-        return;
-    }
+    if (llc.GetType() != ns3::Ipv4L3Protocol::PROT_NUMBER) return;
+
     ns3::Ipv4Header ipHeader;
-    if (packetCopy->GetSize() < ipHeader.GetSerializedSize())
+    if (packetCopy->GetSize() < ipHeader.GetSerializedSize()) return;
+    packetCopy->PeekHeader(ipHeader);
+    ns3::Ipv4Address finalDest = ipHeader.GetDestination();
+
+    // ----- BUG FIX: translate finalDest -> actual next-hop via OLSR table -----
+    // The previous version reported finalDest itself, which for any multi-hop
+    // packet attributes the MAC failure to the wrong neighbor (e.g., reports
+    // failure on Node 0 when the real failed link was to the next-hop neighbor
+    // on the path).
+    RoutingTableEntry entry1;
+    if (!Lookup(finalDest, entry1))
+    {
+        return; // No route -> can't determine next-hop; skip rather than guess.
+    }
+    RoutingTableEntry sendEntry;
+    if (!FindSendEntry(entry1, sendEntry))
     {
         return;
     }
-    packetCopy->PeekHeader(ipHeader);
-    ns3::Ipv4Address neighbor = ipHeader.GetDestination();
-    m_defenseStrategy->OnMacTxFailure(neighbor, 1);
+    Ipv4Address actualNextHop = sendEntry.nextAddr;
+
+    // Sanity: skip self / broadcast / multicast (shouldn't happen, but be safe).
+    if (actualNextHop == m_mainAddress ||
+        actualNextHop == Ipv4Address::GetBroadcast() ||
+        actualNextHop == Ipv4Address::GetAny() ||
+        actualNextHop.IsMulticast())
+    {
+        return;
+    }
+
+    m_defenseStrategy->OnMacTxFailure(actualNextHop, 1);
 }
 
 // ======================================================================
