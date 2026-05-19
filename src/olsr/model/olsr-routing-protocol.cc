@@ -1839,6 +1839,102 @@ RoutingProtocol::SendQueuedMessages()
     m_queuedMessages.clear();
 }
 
+// ==========================================================================
+// SECURITY RESEARCH EXTENSION: Spoof-target builder (passive-learning variant)
+// ==========================================================================
+// Returns up to `maxCount` real OLSR main addresses of nodes the attacker has
+// already heard about through received OLSR traffic, excluding self and real
+// 1-hop neighbors. Uses two protocol-native sources of "distant real nodes":
+//   1) The 2-hop neighbor set, learned from neighbors' HELLO messages.
+//   2) The topology set, learned from flooded TC messages.
+// After a few TC intervals these sources cover essentially every reachable
+// node in the network, which is why the attack should be measured only after
+// a stabilization period.
+// ==========================================================================
+std::vector<Ipv4Address>
+RoutingProtocol::BuildSpoofTargets(uint32_t maxCount) const
+{
+    std::vector<Ipv4Address> result;
+    if (maxCount == 0)
+    {
+        return result;
+    }
+
+    // Build the exclusion set: own addresses + real 1-hop neighbors.
+    // Excluding real neighbors keeps the lie from contradicting the truth
+    // (which would itself be a strong detection signal) and avoids
+    // corrupting our own neighbor/link state.
+    std::set<Ipv4Address> excluded;
+    excluded.insert(m_mainAddress);
+
+    if (m_ipv4)
+    {
+        for (uint32_t i = 0; i < m_ipv4->GetNInterfaces(); ++i)
+        {
+            for (uint32_t j = 0; j < m_ipv4->GetNAddresses(i); ++j)
+            {
+                excluded.insert(m_ipv4->GetAddress(i, j).GetLocal());
+            }
+        }
+    }
+
+    for (const auto& nbr : m_state.GetNeighbors())
+    {
+        excluded.insert(nbr.neighborMainAddr);
+    }
+    for (const auto& link : m_state.GetLinks())
+    {
+        excluded.insert(link.neighborIfaceAddr);
+    }
+
+    // Deduplicate while preserving deterministic order, so HELLO and TC
+    // emissions in the same cycle reference the same spoofed addresses
+    // (an inconsistency between them would be a detection signal).
+    std::set<Ipv4Address> seen;
+
+    // Source 1: 2-hop neighbors. These are real nodes that our 1-hop neighbors
+    // told us about in their HELLOs -- guaranteed to exist and to be reachable.
+    for (const auto& twoHop : m_state.GetTwoHopNeighbors())
+    {
+        const Ipv4Address& addr = twoHop.twoHopNeighborAddr;
+        if (excluded.count(addr) == 0 && seen.insert(addr).second)
+        {
+            result.push_back(addr);
+            if (result.size() >= maxCount)
+            {
+                return result;
+            }
+        }
+    }
+
+    // Source 2: Topology Set. Each tuple (lastAddr advertises destAddr) gives
+    // us two real OLSR main addresses harvested from flooded TC messages.
+    // This expands our reach far beyond the 2-hop horizon.
+    for (const auto& topo : m_state.GetTopologySet())
+    {
+        const Ipv4Address& dest = topo.destAddr;
+        if (excluded.count(dest) == 0 && seen.insert(dest).second)
+        {
+            result.push_back(dest);
+            if (result.size() >= maxCount)
+            {
+                return result;
+            }
+        }
+        const Ipv4Address& last = topo.lastAddr;
+        if (excluded.count(last) == 0 && seen.insert(last).second)
+        {
+            result.push_back(last);
+            if (result.size() >= maxCount)
+            {
+                return result;
+            }
+        }
+    }
+
+    return result;
+}
+
 void
 RoutingProtocol::SendHello()
 {
@@ -1959,28 +2055,43 @@ RoutingProtocol::SendHello()
     }
 
     // ======================================================================
-    // SECURITY RESEARCH EXTENSION: Link Spoofing
+    // SECURITY RESEARCH EXTENSION: Link Spoofing (real-target, passive-learning)
     // ======================================================================
+    // Instead of fabricating non-existent IPs, we falsely claim that real,
+    // distant nodes (learned from received OLSR traffic) are our direct
+    // symmetric 1-hop neighbors. This poisons:
+    //   - the recipient's 2-hop neighbor set (via PopulateTwoHopNeighborSet),
+    //   - the recipient's MPR computation (we appear to provide unique 2-hop
+    //     coverage for these distant nodes),
+    //   - and -- combined with the matching TC injection in SendTc() -- the
+    //     network-wide topology set, which feeds Dijkstra in
+    //     RoutingTableComputation(). Because the destinations are REAL and
+    //     traffic flows toward them, the attacker is now selected as a
+    //     next-hop in actual routing tables, not just as an MPR.
     if (m_isMalicious && m_spoofedLinksCount > 0)
     {
-        olsr::MessageHeader::Hello::LinkMessage spoofedMsg;
+        std::vector<Ipv4Address> spoofTargets = BuildSpoofTargets(m_spoofedLinksCount);
 
-        // Construct LinkCode implying a Symmetric Link and Symmetric Neighbor.
-        // This combination (SYM_LINK + SYM_NEIGH) is the strongest bond in OLSR,
-        // making the node highly attractive for routing paths.
-        spoofedMsg.linkCode = (static_cast<uint8_t>(LinkType::SYM_LINK) & 0x03) |
-                              ((static_cast<uint8_t>(NeighborType::SYM_NEIGH) << 2) & 0x0f);
-
-        for (uint32_t k = 0; k < m_spoofedLinksCount; ++k)
+        if (!spoofTargets.empty())
         {
-            // Generate deterministic fake IP addresses starting from 200.0.0.1 (0xC8000001).
-            // These addresses do not correspond to real nodes, creating a "Blackhole" effect
-            // if traffic is routed towards them via this node.
-            Ipv4Address fakeIp(0xC8000001 + k); 
-            spoofedMsg.neighborInterfaceAddresses.push_back(fakeIp);
-        }
+            olsr::MessageHeader::Hello::LinkMessage spoofedMsg;
 
-        linkMessages.push_back(spoofedMsg);
+            // SYM_LINK + SYM_NEIGH is the strongest possible bond in OLSR and
+            // is required for the recipient to consider these targets as
+            // legitimate 2-hop neighbors reachable through us.
+            spoofedMsg.linkCode = (static_cast<uint8_t>(LinkType::SYM_LINK) & 0x03) |
+                                ((static_cast<uint8_t>(NeighborType::SYM_NEIGH) << 2) & 0x0f);
+
+            for (const auto& addr : spoofTargets)
+            {
+                spoofedMsg.neighborInterfaceAddresses.push_back(addr);
+                NS_LOG_WARN("MALICIOUS HELLO from " << m_mainAddress
+                            << ": falsely advertising real distant node "
+                            << addr << " as a direct symmetric neighbor.");
+            }
+
+            linkMessages.push_back(spoofedMsg);
+        }
     }
     // ======================================================================
 
@@ -2024,6 +2135,42 @@ RoutingProtocol::SendTc()
     {
         tc.neighborAddresses.push_back(mprsel_tuple->mainAddr);
     }
+
+    // ======================================================================
+    // SECURITY RESEARCH EXTENSION: Topology-level Link Spoofing
+    // ======================================================================
+    // HELLO messages travel only 1 hop. To poison nodes more than 2 hops away
+    // -- which is most of the network -- we must also embed the lie in our TC
+    // messages, which are flooded by MPRs throughout the network. Each receiver
+    // calls AddTopologyTuple({lastAddr=us, destAddr=spoofTarget}). Their
+    // RoutingTableComputation() then walks the topology set in
+    // ascending-distance order and inserts a route to spoofTarget whose
+    // next-hop resolves back through us, shortening the apparent distance and
+    // guaranteeing the attacker is chosen as a forwarder.
+    //
+    // The same target list is used for both HELLO and TC so the two layers
+    // stay consistent (an inconsistency would itself be a detection signal).
+    // Placed BEFORE the FPNT-OLSR hook so the defense strategy sees the full
+    // poisoned neighbor list when it computes its evaluation vectors -- this
+    // keeps the defense's view aligned with what the network actually receives.
+    if (m_isMalicious && m_spoofedLinksCount > 0)
+    {
+        std::vector<Ipv4Address> spoofTargets = BuildSpoofTargets(m_spoofedLinksCount);
+        for (const auto& addr : spoofTargets)
+        {
+            // Avoid duplicating an address already present as a real MPR selector.
+            if (std::find(tc.neighborAddresses.begin(),
+                        tc.neighborAddresses.end(),
+                        addr) == tc.neighborAddresses.end())
+            {
+                tc.neighborAddresses.push_back(addr);
+                NS_LOG_WARN("MALICIOUS TC from " << m_mainAddress
+                            << ": falsely advertising real distant node "
+                            << addr << " as an MPR selector.");
+            }
+        }
+    }
+    // ======================================================================
 
     // ======================================================================
     // SECURITY RESEARCH EXTENSION: Self-Topology Monitoring (Ground Truth)
