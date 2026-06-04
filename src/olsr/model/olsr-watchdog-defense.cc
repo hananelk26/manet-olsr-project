@@ -335,29 +335,74 @@ OlsrWatchdogDefense::SetEnabled(bool enabled)
 {
     NS_LOG_FUNCTION(this << enabled);
 
-    const bool turningOn = (!m_enabled && enabled);
+    // No-op skip: a redundant call with the SAME value must not wipe state.
+    // The evaluation harness forces an unconditional reset by toggling the
+    // value twice (!cur then cur); each of those two calls DOES change the
+    // value and therefore DOES reset, so this guard only suppresses true
+    // no-ops (e.g. an attribute re-applied to its current value).
+    if (m_enabled == enabled)
+    {
+        return;
+    }
+
     m_enabled = enabled;
 
-    if (turningOn)
+    // FULL SYMMETRIC cold-start reset on EVERY enabled-state transition, in
+    // BOTH directions (enable->disable and disable->enable). This guarantees
+    // that no accumulated detection state can survive a phase boundary: an
+    // OFF->ON transition cannot inherit a stale blacklist/evidence built up
+    // before the node was disabled, and an ON->OFF transition leaves nothing
+    // behind for a later ON to pick up. Combined with the harness's
+    // unconditional double-toggle at each slot transition, this makes every
+    // measurement window an independent snapshot.
+    ResetAccumulatedState();
+
+    NS_LOG_INFO("Defense on " << m_mainAddress
+                << (enabled ? " ENABLED" : " DISABLED")
+                << " at t=" << Simulator::Now().GetSeconds()
+                << "s (full state reset; warmup until t="
+                << m_warmupUntil.GetSeconds() << "s)");
+}
+
+void
+OlsrWatchdogDefense::ResetAccumulatedState()
+{
+    // The 7 accumulating members (everything that grows/evolves over time):
+    m_blacklist.clear();             // 1. committed blacklist verdicts
+    m_pendingByNeighbor.clear();     // 2. in-flight forwarded-packet tracking
+    m_neighborStats.clear();         // 3. per-neighbor evidence/probation counters
+    m_macToIp.clear();               // 4. learned MAC<->IP map (relearned in warmup)
+    m_selfDropsWindow = 0;           // 5. local PHY-drop window counter
+    m_selfReliabilityScore = 1.0;    // 6. self-reliability EWMA -> default
+    m_warmupUntil = Simulator::Now() + m_warmupDuration; // 7. re-arm warmup
+
+    // Intentionally PRESERVED (these are not accumulated detection state):
+    //   m_protocol, m_mainAddress, m_myMacAddress  -- identity / wiring
+    //   m_attachedPhys                             -- live WiFi trace handles
+    //   m_periodicEvent                            -- self-rescheduling timer
+    //   m_setupDone, all configuration attributes  -- lifecycle / config
+    //   m_enabled                                  -- set by the caller above
+}
+
+OlsrWatchdogDefense::DebugStateSizes
+OlsrWatchdogDefense::GetDebugStateSizes() const
+{
+    DebugStateSizes s;
+    s.blacklist        = m_blacklist.size();
+    s.pendingNeighbors = m_pendingByNeighbor.size();
+    std::size_t total = 0;
+    for (const auto& kv : m_pendingByNeighbor)
     {
-        // On the false->true transition, restart the observation period from
-        // scratch. Otherwise pending packets sent before the toggle would
-        // immediately time out and produce evidence based on a period in
-        // which we were not even watching.
-        m_pendingByNeighbor.clear();
-        m_neighborStats.clear();
-        m_selfDropsWindow = 0;
-        m_selfReliabilityScore = 1.0;
-        m_warmupUntil = Simulator::Now() + m_warmupDuration;
-        NS_LOG_INFO("Defense on " << m_mainAddress
-                    << " ENABLED at t=" << Simulator::Now().GetSeconds()
-                    << "s, warmup until t=" << m_warmupUntil.GetSeconds() << "s");
+        total += kv.second.size();
     }
-    else if (!enabled)
-    {
-        NS_LOG_INFO("Defense on " << m_mainAddress
-                    << " DISABLED at t=" << Simulator::Now().GetSeconds() << "s");
-    }
+    s.pendingTotal     = total;
+    s.neighborStats    = m_neighborStats.size();
+    s.macToIp          = m_macToIp.size();
+    s.selfDropsWindow  = m_selfDropsWindow;
+    // Reports ACTUAL container sizes irrespective of m_enabled, so a read taken
+    // immediately after ResetAccumulatedState() shows all zeros even while
+    // disabled -- exactly what the harness's leak check expects.
+    return s;
 }
 
 // ============================================================================
@@ -396,6 +441,8 @@ OlsrWatchdogDefense::OnDataPacketForwarded(Ptr<const Packet> packet,
 {
     NS_LOG_FUNCTION(this << nextHop << finalDest);
 
+    if (!m_enabled) return;   // OFF => fully inert: accumulate nothing.
+
     // Skip degenerate cases where there is no forwarder to monitor.
     if (nextHop == m_mainAddress)
     {
@@ -432,6 +479,8 @@ OlsrWatchdogDefense::OnMacTxFailure(Ipv4Address neighbor, uint32_t count)
 {
     NS_LOG_FUNCTION(this << neighbor << count);
 
+    if (!m_enabled) return;   // OFF => fully inert: accumulate nothing.
+
     if (neighbor == Ipv4Address() ||
         neighbor == Ipv4Address::GetBroadcast() ||
         neighbor.IsMulticast())
@@ -464,6 +513,7 @@ OlsrWatchdogDefense::SnifferRxCallback(Ptr<const Packet> pkt,
                                        SignalNoiseDbm /*signalNoise*/,
                                        uint16_t /*staId*/)
 {
+    if (!m_enabled) return;   // OFF => fully inert: no sniffing, no MAC<->IP learning.
     if (!pkt)
     {
         return;
@@ -608,6 +658,7 @@ OlsrWatchdogDefense::OnNeighborForwardedPacket(Mac48Address transmitter,
 void
 OlsrWatchdogDefense::OnRtsReceived(Mac48Address sender, Mac48Address /*receiver*/)
 {
+    if (!m_enabled) return;   // OFF => fully inert.
     Ipv4Address ip = LookupIpFromMac(sender);
     if (ip == Ipv4Address())
     {
@@ -627,6 +678,7 @@ void
 OlsrWatchdogDefense::PhyRxDropCallback(Ptr<const Packet> /*pkt*/,
                                         WifiPhyRxfailureReason /*reason*/)
 {
+    if (!m_enabled) return;   // OFF => fully inert.
     // Every PHY drop is a signal that we, the watchdog, might be missing
     // observations. Algorithm B feeds this into m_selfReliabilityScore.
     m_selfDropsWindow++;
@@ -635,6 +687,7 @@ OlsrWatchdogDefense::PhyRxDropCallback(Ptr<const Packet> /*pkt*/,
 void
 OlsrWatchdogDefense::OnSelfReliabilityReport(uint32_t localDropsCount)
 {
+    if (!m_enabled) return;   // OFF => fully inert.
     // External push path (e.g., user code reporting drops). Additive with
     // PhyRxDropCallback so both sources count.
     m_selfDropsWindow += localDropsCount;

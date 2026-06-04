@@ -26,6 +26,7 @@
 #include "ns3/wifi-phy.h"
 #include "ns3/wifi-mac-header.h"
 
+#include <cstddef>
 #include <map>
 #include <set>
 #include <vector>
@@ -69,6 +70,27 @@ public:
     // packets in flight at toggle time don't produce false positives.
     void SetEnabled(bool enabled);
     bool IsEnabled() const { return m_enabled; }
+
+    // Alias for IsEnabled(), provided so the evaluation harness can query the
+    // master switch through the same getter name it uses for other defenses.
+    bool GetEnabled() const { return m_enabled; }
+
+    // ---- Debug / leak-verification support ----
+    // Snapshot of the sizes of every accumulated-state container, used by the
+    // evaluation harness (with --debugDefenseState) to confirm that the
+    // slot-transition cold start really emptied the defense. Reports the ACTUAL
+    // container sizes (NOT gated by m_enabled), so immediately after a reset
+    // every field must read zero regardless of the enabled flag.
+    struct DebugStateSizes
+    {
+        std::size_t blacklist        = 0; //!< # addresses currently blacklisted
+        std::size_t pendingNeighbors = 0; //!< # neighbors with >=1 pending packet
+        std::size_t pendingTotal     = 0; //!< total pending packet entries
+        std::size_t neighborStats    = 0; //!< # neighbors tracked in m_neighborStats
+        std::size_t macToIp          = 0; //!< # learned MAC->IP mappings
+        std::size_t selfDropsWindow  = 0; //!< current local-PHY-drop counter
+    };
+    DebugStateSizes GetDebugStateSizes() const;
 
     // Control plane (unused - not relevant for pure blackhole detection)
     void OnRecvHello(Ipv4Address senderAddress,
@@ -201,6 +223,15 @@ private:
     Time m_warmupUntil;
 
     // ----- Helpers -----
+
+    /** Full symmetric cold-start reset of all accumulated detection state.
+     *  Clears the blacklist, pending-packet tracking, per-neighbor stats and
+     *  the learned MAC<->IP map, zeroes the self-drop counter, restores the
+     *  self-reliability score to 1.0, and re-arms the warmup window to
+     *  (Now + m_warmupDuration). Does NOT touch configuration, identity, the
+     *  attached-PHY trace handles, or the periodic timer. Invoked from
+     *  SetEnabled() on every enabled-state transition. */
+    void ResetAccumulatedState();
 
     /** Connects MonitorSnifferRx and PhyRxDrop callbacks on all WiFi devices. */
     void AttachWifiTraces(Ptr<Node> node);
