@@ -1,0 +1,33 @@
+============================================================
+FPNT-OLSR Batch Runner -- Summary
+============================================================
+Date completed : 2026-06-04T18:11:03Z
+Total elapsed  : 13688s (3.80h)
+
+Attempts       : 2858
+  Accepted     : 1005  (target: 1000)
+  Rejected     : 1849
+  Errors       : 4
+Yield          : 0.3516
+Window order   : canonical
+
+PDR summary (oracle table):
+  windows=4020  pdr_mean=87.27%  pdr_min=0.00%  pdr_max=100.00%
+
+Rejection reasons (top 10):
+   1458 assert_connectivity
+    391 too_close
+
+Output files:
+  /home/hananel/workspace/ns-3-dev/out_dcfm_ordered/runs.csv
+  /home/hananel/workspace/ns-3-dev/out_dcfm_ordered/windows_features.csv
+  /home/hananel/workspace/ns-3-dev/out_dcfm_ordered/windows_labels.csv
+  /home/hananel/workspace/ns-3-dev/out_dcfm_ordered/windows_oracle.csv
+  /home/hananel/workspace/ns-3-dev/out_dcfm_ordered/probe.csv
+  (per-attempt logs in /home/hananel/workspace/ns-3-dev/out_dcfm_ordered/logs)
+
+ML pipeline note:
+  Load ONLY /home/hananel/workspace/ns-3-dev/out_dcfm_ordered/windows_features.csv (as X) and /home/hananel/workspace/ns-3-dev/out_dcfm_ordered/windows_labels.csv (as y).
+  /home/hananel/workspace/ns-3-dev/out_dcfm_ordered/windows_oracle.csv contains ground-truth columns that are NOT
+  observable from the wire and MUST NOT be used as features.
+============================================================

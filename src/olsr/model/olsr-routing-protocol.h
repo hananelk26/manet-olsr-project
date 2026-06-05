@@ -313,20 +313,20 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     uint32_t m_spoofedLinksCount;
 
     /**
-    * @brief Build a list of real, distant node addresses to spoof as direct neighbors.
-    *
-    * Collects real OLSR main addresses that this attacker has organically learned
-    * about via received control traffic: the 2-hop neighbor set (populated from
-    * neighbors' HELLO messages) and the topology set (populated from flooded TC
-    * messages). Excludes this node's own addresses and its actual 1-hop neighbors.
-    *
-    * No oracle access to the simulator is used -- everything is derived from
-    * in-protocol observations, which makes the attacker indistinguishable from
-    * a node that has simply been listening to the network for a while.
-    *
-    * @param maxCount Upper bound on how many addresses to return.
-    * @return Vector of real distant node main addresses (size <= maxCount).
-    */
+     * @brief Build a list of real, distant node addresses to spoof as direct neighbors.
+     *
+     * Collects real OLSR main addresses that this attacker has organically learned
+     * about via received control traffic: the 2-hop neighbor set (populated from
+     * neighbors' HELLO messages) and the topology set (populated from flooded TC
+     * messages). Excludes this node's own addresses and its actual 1-hop neighbors.
+     *
+     * No oracle access to the simulator is used -- everything is derived from
+     * in-protocol observations, which makes the attacker indistinguishable from
+     * a node that has simply been listening to the network for a while.
+     *
+     * @param maxCount Upper bound on how many addresses to return.
+     * @return Vector of real distant node main addresses (size <= maxCount).
+     */
     std::vector<Ipv4Address> BuildSpoofTargets(uint32_t maxCount) const;
 
     // ======================================================================
@@ -454,10 +454,29 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     // ======================================================================
     // SECURITY RESEARCH EXTENSION: 
     // ======================================================================
+    void ProcessPromiscPacket (Ptr<const Packet> packet);
 
     void HandleDefenseTimer();
     Timer m_defenseTimer;
-    
+
+    /**
+   * \brief Trace callback to sniff neighbor traffic at the PHY layer.
+   * Matches signature: ns3::WifiPhy::MonitorSnifferRxCallback
+   */
+  void MonitorSnifferRx (Ptr<const Packet> packet, 
+                         uint16_t channelFreqMhz, 
+                         WifiTxVector txVector, 
+                         MpduInfo aMpdu, 
+                         SignalNoiseDbm signalNoise, 
+                         uint16_t staId);
+
+    /**
+    * \brief Helper to attach the sniffer to the WifiPhy.
+    */
+    void SetupPromiscuousMonitor ();
+
+    /// Flag to ensure we only attach the monitor once
+    bool m_monitorSetupDone;
     // ======================================================================
     /**
      * Send an OLSR message.
@@ -932,7 +951,24 @@ class RoutingProtocol : public Ipv4RoutingProtocol
     /// Provides uniform random variables.
     Ptr<UniformRandomVariable> m_uniformRandomVariable;
 
+    // ======================================================================
+    // SECURITY RESEARCH EXTENSION: Self-Reliability & Cross Layer
+    // ======================================================================
     
+    /**
+     * Counter for local physical layer reception failures (collisions/noise).
+     * Used to determine if "my" watchdog observations are reliable.
+     */
+    uint32_t m_localRxDrops;
+
+    /**
+     * Trace callback for PhyRxDrop.
+     * @param packet The dropped packet.
+     * @param reason The reason for the drop.
+     */
+    void OnLocalRxDrop (Ptr<const Packet> packet, ns3::WifiPhyRxfailureReason reason);
+    
+    // ======================================================================
 };
 
 } // namespace olsr

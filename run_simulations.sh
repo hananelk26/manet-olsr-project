@@ -1,7 +1,8 @@
 #!/bin/bash
 # =============================================================================
 # run_simulations.sh
-#   Resumable, parallel batch runner for the FPNT-OLSR evaluation harness.
+#   Resumable, parallel batch runner for the OLSR defense-evaluation harnesses
+#   (FPNT / Watchdog / DCFM). Select a defense with --defense or --scratch.
 #   POST-AUDIT REWRITE (Phase 2).
 # =============================================================================
 #
@@ -59,7 +60,13 @@ Optional:
   -j, --jobs J                Parallel workers (default: 1).
   -o, --output-dir DIR        Output directory (default: ./simulations/features).
       --ns3-dir DIR           Path to ns-3-dev root (default: ./).
+      --defense NAME          Convenience selector for the defense harness:
+                              one of {fpnt, watchdog, dcfm}. Maps to the
+                              matching scratch program. Mutually exclusive
+                              with --scratch (unless they agree).
       --scratch NAME          Scratch program name (default: olsr-fpnt-eval-mitigation).
+                              Use this to point at a non-standard binary;
+                              otherwise prefer --defense.
       --start-seed S          Starting seed (default: 1).
       --max-attempts M        Hard cap on attempts (default: auto from --calibrate or 5x target).
       --calibrate [N]         Pre-flight N attempts (default 200 if no arg) to measure yield.
@@ -116,7 +123,9 @@ N_TARGET=""
 JOBS=1
 OUT_DIR="./simulations/features"
 NS3_DIR="./"
-SCRATCH="olsr-fpnt-eval-mitigation"
+DEFENSE=""                            # GEN: --defense {fpnt|watchdog|dcfm} selector
+SCRATCH="olsr-fpnt-eval-mitigation"   # default; overridden by --defense or --scratch
+SCRATCH_EXPLICIT=0                     # set to 1 when --scratch is passed explicitly
 START_SEED=1
 MAX_ATTEMPTS=""
 CALIBRATE_REQUESTED=0
@@ -138,7 +147,8 @@ while [[ $# -gt 0 ]]; do
     -j|--jobs)           JOBS="$2"; shift 2 ;;
     -o|--output-dir)     OUT_DIR="$2"; shift 2 ;;
     --ns3-dir)           NS3_DIR="$2"; shift 2 ;;
-    --scratch)           SCRATCH="$2"; shift 2 ;;
+    --scratch)           SCRATCH="$2"; SCRATCH_EXPLICIT=1; shift 2 ;;
+    --defense)           DEFENSE="$2"; shift 2 ;;
     --start-seed)        START_SEED="$2"; shift 2 ;;
     --max-attempts)      MAX_ATTEMPTS="$2"; shift 2 ;;
     --calibrate)
@@ -165,6 +175,36 @@ fi
 if ! [[ "$JOBS" =~ ^[0-9]+$ && "$JOBS" -gt 0 ]]; then
   echo "ERROR: --jobs must be a positive integer." >&2; exit 1
 fi
+
+# --- GEN: resolve --defense {fpnt|watchdog|dcfm} -> scratch program ----------
+# --defense is a convenience selector mapping to the per-defense scratch binary.
+# --scratch still works directly; passing both is an error unless they agree.
+# Resolved here (before any orchestrator self-re-invocation) so child batches
+# inherit the concrete --scratch.
+if [[ -n "$DEFENSE" ]]; then
+  case "$DEFENSE" in
+    fpnt)     mapped="olsr-fpnt-eval-mitigation" ;;
+    watchdog) mapped="olsr-watchdog-eval-mitigation" ;;
+    dcfm)     mapped="olsr-dcfm-eval-mitigation" ;;
+    *) echo "ERROR: --defense must be one of: fpnt, watchdog, dcfm." >&2; exit 1 ;;
+  esac
+  if [[ $SCRATCH_EXPLICIT -eq 1 && "$SCRATCH" != "$mapped" ]]; then
+    echo "ERROR: --defense '$DEFENSE' implies --scratch '$mapped', but" >&2
+    echo "       --scratch '$SCRATCH' was also given. Pass only one." >&2
+    exit 1
+  fi
+  SCRATCH="$mapped"
+fi
+
+# Human-readable defense label (console/summary banners only), derived from the
+# final scratch program name so it is correct whether set via --defense,
+# --scratch, or the default.
+case "$SCRATCH" in
+  *fpnt*)     DEFENSE_LABEL="FPNT-OLSR" ;;
+  *watchdog*) DEFENSE_LABEL="Watchdog-OLSR" ;;
+  *dcfm*)     DEFENSE_LABEL="DCFM-OLSR" ;;
+  *)          DEFENSE_LABEL="$SCRATCH" ;;
+esac
 
 # --- canonicalize paths -----------------------------------------------------
 mkdir -p "$OUT_DIR"
@@ -274,6 +314,7 @@ FEATURES_FILE="$OUT_DIR/windows_features.csv"
 LABELS_FILE="$OUT_DIR/windows_labels.csv"
 ORACLE_FILE="$OUT_DIR/windows_oracle.csv"
 PROBE_FILE="$OUT_DIR/probe.csv"
+DEFPARAMS_FILE="$OUT_DIR/defense_params.txt"   # GEN-004: provenance sidecar (not an ML input)
 LOG_DIR="$OUT_DIR/logs"
 RUNSTATE_DIR="$OUT_DIR/.runstate"
 LEDGER="$RUNSTATE_DIR/seeds.ledger"
@@ -291,14 +332,15 @@ if [[ $FRESH -eq 1 ]]; then
   echo "======================================================================="
   echo "  --fresh: WIPING $OUT_DIR"
   echo "  Targets: runs.csv, windows_features.csv, windows_labels.csv,"
-  echo "           windows_oracle.csv, probe.csv, .runstate/, .staging/"
+  echo "           windows_oracle.csv, probe.csv, defense_params.txt,"
+  echo "           .runstate/, .staging/"
   echo "======================================================================="
   read -r -p "Confirm by typing YES: " confirm
   if [[ "$confirm" != "YES" ]]; then
     echo "Aborted."; exit 1
   fi
   rm -rf "$RUNSTATE_DIR" "$OUT_DIR/.staging"
-  rm -f  "$RUNS_FILE" "$FEATURES_FILE" "$LABELS_FILE" "$ORACLE_FILE" "$PROBE_FILE"
+  rm -f  "$RUNS_FILE" "$FEATURES_FILE" "$LABELS_FILE" "$ORACLE_FILE" "$PROBE_FILE" "$DEFPARAMS_FILE"
   echo "Wiped. Resuming."
 fi
 
@@ -434,6 +476,7 @@ run_one() {
       --labelsFile=$LABELS_FILE \
       --oracleFile=$ORACLE_FILE \
       --topologyProbeFile=$PROBE_FILE \
+      --defenseParamsFile=$DEFPARAMS_FILE \
       --outputDir=$OUT_DIR \
       $EXTRA_ARGS $RWO_ARG" \
       ) >"$logfile" 2>&1
@@ -576,7 +619,7 @@ EOF
 
 # --- main loop --------------------------------------------------------------
 echo "======================================================================="
-echo "  FPNT-OLSR Batch Runner"
+echo "  $DEFENSE_LABEL Batch Runner"
 echo "  Target accepted runs : $N_TARGET"
 echo "  Jobs                 : $JOBS"
 echo "  Output dir           : $OUT_DIR"
@@ -766,7 +809,7 @@ fi
 
 cat > "$RUNNER_SUMMARY" <<EOF
 ============================================================
-FPNT-OLSR Batch Runner -- Summary
+$DEFENSE_LABEL Batch Runner -- Summary
 ============================================================
 Date completed : $(date -u +%Y-%m-%dT%H:%M:%SZ)
 Total elapsed  : ${TOTAL_ELAPSED}s ($(awk -v s="$TOTAL_ELAPSED" 'BEGIN{printf "%.2f", s/3600}')h)
@@ -790,6 +833,7 @@ Output files:
   $LABELS_FILE
   $ORACLE_FILE
   $PROBE_FILE
+  $DEFPARAMS_FILE  (defense parameters; provenance, NOT an ML input)
   (per-attempt logs in $LOG_DIR)
 
 ML pipeline note:

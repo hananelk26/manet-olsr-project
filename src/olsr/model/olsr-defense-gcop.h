@@ -3,7 +3,11 @@
 
 #include "olsr-defense-strategy.h"
 #include "ns3/timer.h"
+// HARNESS INTEGRATION: explicit includes for the ON/OFF switch additions
+// (Time for the warmup anchor, std::size_t for DebugStateSizes).
+#include "ns3/nstime.h"
 
+#include <cstddef>
 #include <map>
 #include <set>
 #include <string>
@@ -49,6 +53,13 @@ class RoutingProtocol;
  *   - Warmup window before any rule is evaluated.
  *   - 2-strike confirmation policy to filter transient false positives.
  *   - Time-windowed blacklist with periodic garbage collection.
+ *   - Evaluation-harness integration: a dynamic Enabled switch (ns-3
+ *     attribute, default false) performing a FULL SYMMETRIC cold-start
+ *     reset on every real ON/OFF transition, with the warmup window
+ *     re-anchored to the enable instant, plus a read-only DebugStateSizes
+ *     audit. While disabled the strategy is fully inert: it accumulates no
+ *     state, reports no node as malicious, returns an empty blacklist and
+ *     never requests a fictitious node.
  */
 class OlsrDefenseGcop : public OlsrDefenseStrategy {
 public:
@@ -63,6 +74,50 @@ public:
     // --- Blacklist queries ---
     virtual bool IsMalicious(Ipv4Address addr) override;
     virtual std::set<Ipv4Address> GetBlacklist() const override;
+
+    // ======================================================================
+    // HARNESS INTEGRATION: dynamic ON/OFF switch + symmetric cold start
+    // ======================================================================
+    /**
+     * \brief Enable/disable the defense at runtime (the "Enabled" attribute).
+     *
+     * No-op guard: a call that does not change the state returns immediately
+     * (so a redundant SetAttribute("Enabled", ...) mid-window cannot wipe
+     * live state, and the attribute system's application of the default at
+     * construction is harmless).
+     *
+     * Symmetric cold start: EVERY real transition -- enable->disable AND
+     * disable->enable -- wipes all accumulated detection state
+     * (m_suspiciousNodes, m_violationCounter) and, on the enable leg,
+     * re-anchors the warmup window (m_enableTime = Simulator::Now()). The
+     * harness's ForceDefenseColdStart() double-toggle therefore always
+     * produces exactly two real transitions and a guaranteed full wipe,
+     * restoring the slot's intended ON/OFF value.
+     *
+     * Wipes ONLY defense-owned state; the Setup() wiring
+     * (m_routingProtocol, m_mainAddress) is intentionally untouched.
+     */
+    void SetEnabled(bool enabled);
+
+    /// \return Current ON/OFF state (the "Enabled" attribute getter).
+    bool GetEnabled() const;
+
+    /**
+     * \brief Raw sizes of every accumulated-state container.
+     *
+     * Read-only diagnostics for the harness's --debugDefenseState audit.
+     * The sizes are RAW container sizes, deliberately NOT gated on
+     * m_enabled: a print taken immediately after a cold start must read all
+     * zeros, and any non-zero value is direct evidence of a cross-window
+     * leak through defense state.
+     */
+    struct DebugStateSizes
+    {
+        std::size_t suspiciousNodes;  //!< |m_suspiciousNodes| (incl. expired entries)
+        std::size_t violationCounter; //!< |m_violationCounter| (incl. zero-valued entries)
+    };
+    DebugStateSizes GetDebugStateSizes() const;
+    // ======================================================================
 
     // --- Control plane hooks ---
     virtual void OnRecvHello(Ipv4Address senderAddress,
@@ -168,6 +223,29 @@ private:
      * lost over a marginal MAC link).
      */
     std::map<Ipv4Address, uint32_t> m_violationCounter;
+
+    // ======================================================================
+    // HARNESS INTEGRATION state
+    // ======================================================================
+    /**
+     * \brief Dynamic ON/OFF switch ("Enabled" attribute). Default false.
+     *
+     * Gates every state-mutating handler (OnRecvHello /
+     * EvaluateContradictionRules, PeriodicCheck), every on-air behavior
+     * source (RequiresFictitiousNode) and every RP-facing query
+     * (IsMalicious, GetBlacklist), so a disabled strategy is fully inert
+     * and a defense-OFF window is indistinguishable from a clean baseline.
+     */
+    bool m_enabled;
+
+    /**
+     * \brief Warmup anchor: Simulator::Now() at the last OFF->ON transition.
+     *
+     * EvaluateContradictionRules() stays silent for WARMUP_SECONDS after
+     * this instant (re-anchored semantics of the original absolute-time
+     * warmup; see the comment at the warmup check).
+     */
+    Time m_enableTime;
 };
 
 } // namespace olsr

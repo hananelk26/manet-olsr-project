@@ -2,6 +2,9 @@
 #include "olsr-routing-protocol.h"
 #include "ns3/log.h"
 #include "ns3/simulator.h"
+// HARNESS INTEGRATION: BooleanValue / MakeBooleanAccessor / MakeBooleanChecker
+// for the "Enabled" attribute.
+#include "ns3/boolean.h"
 
 #include <algorithm>
 #include <vector>
@@ -22,9 +25,13 @@ NS_OBJECT_ENSURE_REGISTERED(OlsrDefenseGcop);
 // parameters in the paper (HELLO=2s, TC=5s, 300s simulation, 50-100 nodes).
 // ============================================================================
 
-/// Seconds to wait after Setup() before any C-Rule is evaluated. Required
-/// because Rule 2 and Rule 3 read the topology set, which only converges
-/// after several TC cycles. HELLO=2s, TC=5s => ~9 TC opportunities in 45s.
+/// Seconds to wait after the defense is (re-)ENABLED before any C-Rule is
+/// evaluated. HARNESS INTEGRATION: the check is anchored to m_enableTime
+/// (the last OFF->ON transition) rather than to absolute simulation time --
+/// see the comment at the warmup check in EvaluateContradictionRules().
+/// Required because Rule 2 and Rule 3 read the topology set, which only
+/// converges after several TC cycles. HELLO=2s, TC=5s => ~9 TC
+/// opportunities in 45s. The DURATION is unchanged from the original.
 static const double WARMUP_SECONDS = 45.0;
 
 /// How long a flagged node remains on the blacklist after the last triggering
@@ -78,13 +85,34 @@ TypeId OlsrDefenseGcop::GetTypeId(void) {
     static TypeId tid = TypeId("ns3::olsr::OlsrDefenseGcop")
         .SetParent<OlsrDefenseStrategy>()
         .SetGroupName("Olsr")
-        .AddConstructor<OlsrDefenseGcop>();
+        .AddConstructor<OlsrDefenseGcop>()
+        // HARNESS INTEGRATION: the ONLY attribute the evaluation harness
+        // sets/toggles. Wired through SetEnabled/GetEnabled so BOTH access
+        // paths -- SetAttribute("Enabled", ...) at slot transitions and the
+        // direct SetEnabled() double-toggle inside the harness's
+        // ForceDefenseColdStart() -- run the same symmetric cold-start
+        // logic.
+        .AddAttribute("Enabled",
+                      "Dynamic ON/OFF switch. Every real state transition "
+                      "(both directions) performs a full symmetric "
+                      "cold-start wipe of all accumulated detection state; "
+                      "while false the strategy is fully inert.",
+                      BooleanValue(false),
+                      MakeBooleanAccessor(&OlsrDefenseGcop::SetEnabled,
+                                          &OlsrDefenseGcop::GetEnabled),
+                      MakeBooleanChecker());
     return tid;
 }
 
 OlsrDefenseGcop::OlsrDefenseGcop()
     : m_routingProtocol(nullptr),
-      m_startTime(0.0)
+      m_startTime(0.0),
+      // HARNESS INTEGRATION: start DISABLED. The attribute system's
+      // application of the Enabled default (false) at construction, and the
+      // harness's explicit SetAttribute("Enabled", false) at install time,
+      // both hit the SetEnabled no-op guard -- by design.
+      m_enabled(false),
+      m_enableTime(Seconds(0))
 {
 }
 
@@ -94,12 +122,17 @@ OlsrDefenseGcop::~OlsrDefenseGcop() {
 void OlsrDefenseGcop::Setup(RoutingProtocol* proto, Ipv4Address nodeAddress) {
     m_routingProtocol = proto;
     m_mainAddress = nodeAddress;
+    // HARNESS INTEGRATION note: m_startTime is retained for provenance /
+    // minimal diff only. Since the ON/OFF integration the warmup anchor is
+    // m_enableTime (re-armed on every OFF->ON transition in SetEnabled),
+    // NOT this value.
     m_startTime = Simulator::Now().GetSeconds();
 }
 
 void OlsrDefenseGcop::DoDispose() {
     m_suspiciousNodes.clear();
     m_violationCounter.clear();
+    m_enabled = false;   // HARNESS INTEGRATION: leave the object inert after disposal
     m_routingProtocol = nullptr;
 }
 
@@ -108,6 +141,14 @@ void OlsrDefenseGcop::DoDispose() {
 // ============================================================================
 
 bool OlsrDefenseGcop::IsMalicious(Ipv4Address addr) {
+    // HARNESS INTEGRATION (OFF-guard): while disabled, never report anyone
+    // as malicious. This neutralizes by construction every RP-side consumer
+    // (RecvOlsr message filter, MPR exclusion, routing/HNA-table exclusion,
+    // IMP next-hop drop) even at transition instants -- a defense-OFF
+    // window must be indistinguishable from a clean baseline.
+    if (!m_enabled) {
+        return false;
+    }
     auto it = m_suspiciousNodes.find(addr);
     if (it != m_suspiciousNodes.end() && Simulator::Now() <= it->second) {
         return true;
@@ -117,6 +158,13 @@ bool OlsrDefenseGcop::IsMalicious(Ipv4Address addr) {
 
 std::set<Ipv4Address> OlsrDefenseGcop::GetBlacklist() const {
     std::set<Ipv4Address> blacklist;
+    // HARNESS INTEGRATION (OFF-guard): while disabled the truthful answer is
+    // "no blacklist". The harness's ObserveAttackerOnPath queries this in
+    // EVERY window (including OFF windows); an empty set keeps the oracle
+    // trust proxy at 1.0, exactly as in the FPNT/Watchdog harnesses.
+    if (!m_enabled) {
+        return blacklist;
+    }
     Time now = Simulator::Now();
     for (auto const& pair : m_suspiciousNodes) {
         if (now <= pair.second) {
@@ -142,6 +190,14 @@ bool OlsrDefenseGcop::HasKnownMaliciousNeighbor() {
 // ============================================================================
 
 void OlsrDefenseGcop::PeriodicCheck() {
+    // HARNESS INTEGRATION (OFF-guard): this is driven UNCONDITIONALLY every
+    // 1 s by RoutingProtocol::HandleDefenseTimer, regardless of the Enabled
+    // state. The GC below mutates state (map::erase plus a zero-value
+    // operator[] insertion into m_violationCounter), and a disabled
+    // strategy must accumulate / mutate nothing.
+    if (!m_enabled) {
+        return;
+    }
     // Garbage collect expired blacklist entries: a previously flagged node
     // that has gone silent (or whose triggering attack has ended) is given
     // a chance to participate again.
@@ -163,6 +219,16 @@ void OlsrDefenseGcop::PeriodicCheck() {
 }
 
 bool OlsrDefenseGcop::RequiresFictitiousNode() {
+    // HARNESS INTEGRATION (CRITICAL OFF-guard): RoutingProtocol queries this
+    // on EVERY HELLO and EVERY TC it generates. Without this guard a
+    // disabled node would keep injecting fictitious entries into its
+    // HELLO/TC messages, making a defense-OFF window observably different
+    // from a clean baseline on the air. (When ENABLED, the injection IS the
+    // defense's authentic on-air signature and is intentionally not gated
+    // by the warmup -- faithful to the original, which had no such gate.)
+    if (!m_enabled) {
+        return false;
+    }
     // The paper recommends the GCOP + GCOHP combination: GCOP handles the
     // standard 2-hop-coverage case (Section 5.1) while GCOHP catches the
     // hexagon edge case in which GCOP yields a false negative (Section 5.2).
@@ -173,6 +239,76 @@ bool OlsrDefenseGcop::RequiresFictitiousNode() {
 }
 
 // ============================================================================
+// HARNESS INTEGRATION: dynamic ON/OFF switch + symmetric cold start
+// ----------------------------------------------------------------------------
+// The evaluation harness measures 4 windows back-to-back on the same network
+// (baseline / attack / defense / defense+attack) and performs an
+// UNCONDITIONAL cold start at every slot transition by toggling Enabled
+// twice (SetEnabled(!cur); SetEnabled(cur);). The contract implemented here:
+//   * no-op guard      -- a call that does not change the state is a strict
+//                         no-op, so a redundant SetAttribute mid-window can
+//                         never wipe live state;
+//   * symmetric reset  -- every REAL transition, in BOTH directions, clears
+//                         ALL accumulated detection state, so the double
+//                         toggle always leaves the object indistinguishable
+//                         from a freshly loaded one with the slot's intended
+//                         ON/OFF value;
+//   * warmup re-anchor -- the enable leg re-arms m_enableTime so the full
+//                         WARMUP_SECONDS run inside the slot's 60 s
+//                         stabilization period (option C);
+//   * scope            -- only defense-owned state is wiped. The Setup()
+//                         wiring (m_routingProtocol, m_mainAddress) is
+//                         untouched, and no RP/OLSR state is reset from here
+//                         (stale MPR/route exclusions and expired tuples
+//                         re-converge naturally within the stabilization
+//                         window).
+// ============================================================================
+
+void OlsrDefenseGcop::SetEnabled(bool enabled) {
+    // No-op guard (aligned with the Watchdog pattern): only a REAL
+    // transition resets. The attribute default application at construction
+    // (false -> false) and the harness's explicit Enabled=false at install
+    // time both land here harmlessly.
+    if (m_enabled == enabled) {
+        return;
+    }
+
+    // FULL SYMMETRIC COLD START -- both directions.
+    m_suspiciousNodes.clear();
+    m_violationCounter.clear();
+
+    m_enabled = enabled;
+
+    if (m_enabled) {
+        // Re-anchor the warmup window: the C-Rules stay silent for
+        // WARMUP_SECONDS after EVERY enable, exactly like the original
+        // single-activation design in which Setup() at t~0 made the
+        // absolute-time check equivalent. Under option C this anchor lands
+        // at the slot transition, so the full 45 s warmup completes inside
+        // the 60 s stabilization period.
+        m_enableTime = Simulator::Now();
+    }
+
+    NS_LOG_INFO("DCFM defense on " << m_mainAddress << " -> "
+                << (m_enabled ? "ENABLED" : "DISABLED")
+                << " (cold start: all detection state cleared)");
+}
+
+bool OlsrDefenseGcop::GetEnabled() const {
+    return m_enabled;
+}
+
+OlsrDefenseGcop::DebugStateSizes OlsrDefenseGcop::GetDebugStateSizes() const {
+    // RAW container sizes, deliberately NOT gated on m_enabled: immediately
+    // after a cold start these MUST read zero on every node; any non-zero
+    // value is direct evidence of a cross-window leak through defense state.
+    DebugStateSizes s;
+    s.suspiciousNodes  = m_suspiciousNodes.size();
+    s.violationCounter = m_violationCounter.size();
+    return s;
+}
+
+// ============================================================================
 // Control plane hooks
 // ============================================================================
 
@@ -180,6 +316,13 @@ void OlsrDefenseGcop::OnRecvHello(Ipv4Address senderAddress,
                                   Ptr<const Packet> /*packet*/,
                                   const MessageHeader& /*msg*/,
                                   const MessageHeader::Hello& /*hello*/) {
+    // HARNESS INTEGRATION (OFF-guard): primary state-mutation entry point,
+    // called by RecvOlsr for EVERY received HELLO (before the RP's own
+    // filtering). While disabled no strikes / blacklist entries may
+    // accumulate.
+    if (!m_enabled) {
+        return;
+    }
     EvaluateContradictionRules(senderAddress);
 }
 
@@ -192,6 +335,11 @@ void OlsrDefenseGcop::OnDataPacketReceived(Ptr<const Packet> /*packet*/,
                                            Ipv4Address /*source*/,
                                            Ipv4Address /*destination*/,
                                            Ipv4Address nextHop) {
+    // HARNESS INTEGRATION (OFF-guard): log-only hook, but a disabled
+    // strategy must do zero work (inertness principle).
+    if (!m_enabled) {
+        return;
+    }
     if (IsMalicious(nextHop)) {
         NS_LOG_INFO("About to forward packet via suspicious next-hop " << nextHop);
     }
@@ -200,6 +348,10 @@ void OlsrDefenseGcop::OnDataPacketReceived(Ptr<const Packet> /*packet*/,
 void OlsrDefenseGcop::OnDataPacketForwarded(Ptr<const Packet> /*packet*/,
                                             Ipv4Address nextHop,
                                             Ipv4Address /*finalDest*/) {
+    // HARNESS INTEGRATION (OFF-guard): log-only hook, same rationale.
+    if (!m_enabled) {
+        return;
+    }
     if (IsMalicious(nextHop)) {
         NS_LOG_WARN("IMP Mechanism triggered! Intercepted attempt to forward "
                     "packet to malicious Next-Hop " << nextHop);
@@ -218,11 +370,29 @@ void OlsrDefenseGcop::OnDataPacketForwarded(Ptr<const Packet> /*packet*/,
 // ============================================================================
 
 void OlsrDefenseGcop::EvaluateContradictionRules(Ipv4Address senderAddress) {
+    // HARNESS INTEGRATION (defensive double-guard): OnRecvHello already
+    // gates, but this is the ONLY function that writes m_violationCounter /
+    // m_suspiciousNodes -- guard it directly as well.
+    if (!m_enabled) return;
     if (!m_routingProtocol) return;
 
     // Convergence warmup: Rule 2 and Rule 3 depend on a populated topology
     // set, which requires several TC rounds to stabilize.
-    if (Simulator::Now().GetSeconds() < WARMUP_SECONDS) {
+    //
+    // HARNESS INTEGRATION (warmup RE-ANCHOR): the check is anchored to
+    // m_enableTime (the last OFF->ON transition) instead of absolute
+    // simulation time. In the original single-activation design Setup() ran
+    // at t~0, so the absolute check was equivalent; in the 4-window harness
+    // every window starts at t>=60 and the absolute check would have been
+    // permanently elapsed (the warmup would never run). Anchoring to the
+    // enable instant restores the original semantics -- WARMUP_SECONDS of
+    // topology-set settling after (re-)activation -- identically in every
+    // defense-ON window. The duration is deliberately kept at the FULL
+    // original 45 s (not shortened): under option C the anchor lands at the
+    // slot transition, so warmup (45 s) + two-strike detection (~4 s) +
+    // enforcement and OLSR re-convergence all complete by ~t0+51..56 s,
+    // inside the 60 s stabilization period.
+    if ((Simulator::Now() - m_enableTime).GetSeconds() < WARMUP_SECONDS) {
         return;
     }
 

@@ -1,0 +1,10 @@
+{
+  "n_calibration_attempts": 200,
+  "accepted": 59,
+  "rejected": 140,
+  "yield": 0.295000,
+  "mean_wall_clock_seconds": 12.94,
+  "elapsed_seconds": 2587,
+  "projected_attempts_for_1000_accepted": 3389,
+  "selected_max_attempts": 4407
+}
