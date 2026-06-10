@@ -405,7 +405,7 @@ extract_rejection_reason() {
 verify_headers() {
   # Get current headers from the harness.
   local hdr_output
-  if ! hdr_output="$(cd "$NS3_DIR" && ./ns3 run "$SCRATCH --emit-header" 2>/dev/null)"; then
+  if ! hdr_output="$(cd "$NS3_DIR" && ./ns3 run --no-build "$SCRATCH --emit-header" 2>/dev/null)"; then
     echo "ERROR: failed to run --emit-header; cannot verify schema." >&2
     echo "  Check that the scratch program builds: cd $NS3_DIR && ./ns3 build" >&2
     return 1
@@ -468,7 +468,7 @@ run_one() {
 
   # The harness writes to all four output files directly (with internal
   # flock for atomicity). We just pass paths and the seed.
-  (cd "$NS3_DIR" && ./ns3 run "$SCRATCH \
+  (cd "$NS3_DIR" && ./ns3 run --no-build "$SCRATCH \
       --run=$seed \
       --seed=1 \
       --runsFile=$RUNS_FILE \
