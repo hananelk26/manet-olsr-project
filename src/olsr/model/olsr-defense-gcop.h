@@ -246,6 +246,17 @@ private:
      * warmup; see the comment at the warmup check).
      */
     Time m_enableTime;
+
+    /**
+     * \brief Fictitious-node switch ("UseFictitiousNodes" attribute). Default true.
+     *
+     * true  = full paper mechanism: RequiresFictitiousNode() runs the
+     *         GCOP/GCOHP decision and the Rule-1 bait sub-check is active.
+     * false = paper "C-Rules": no fictitious node is advertised and the bait
+     *         sub-check is skipped. The three contradiction rules run in both
+     *         modes; this flag never disables a rule.
+     */
+    bool m_useFictitiousNodes;
 };
 
 } // namespace olsr

@@ -75,7 +75,11 @@ static const size_t MIN_ASYMMETRY_FOR_RULE1B = 2;
 /// MIN_UNCOVERED_FOR_RULE2 and MIN_ASYMMETRY_FOR_RULE1B), this filter's
 /// benefit (cleaning attacker pollution) may be offset by its risk
 /// (amplifying rare FP cascades). Disable to compare empirically.
-static const bool ENABLE_TOPOLOGY_FILTER = true;
+/// PAPER ALIGNMENT: DISABLED. The paper assumes TC cannot be spoofed, so the
+/// contradiction rules never filter the topology set in response to a
+/// suspicion ("don't touch TC"). Re-enabling improves FP robustness against
+/// the link-spoofing attacker, at the cost of paper fidelity.
+static const bool ENABLE_TOPOLOGY_FILTER = false;
 
 // ============================================================================
 // Type registration and lifecycle
@@ -100,6 +104,20 @@ TypeId OlsrDefenseGcop::GetTypeId(void) {
                       BooleanValue(false),
                       MakeBooleanAccessor(&OlsrDefenseGcop::SetEnabled,
                                           &OlsrDefenseGcop::GetEnabled),
+                      MakeBooleanChecker())
+        // PAPER ALIGNMENT: selects the defense configuration.
+        //   true  (default) = full paper mechanism: 3 contradiction rules +
+        //                     GCOP/GCOHP fictitious-node injection + Rule-1 bait.
+        //   false           = paper "C-Rules": the 3 contradiction rules only,
+        //                     no fictitious injection, bait sub-check skipped.
+        // The three contradiction rules are UNAFFECTED in both modes.
+        .AddAttribute("UseFictitiousNodes",
+                      "When true (default) advertise fictitious nodes "
+                      "(GCOP/GCOHP) and run the Rule-1 bait sub-check; when "
+                      "false run the three contradiction rules only (paper "
+                      "C-Rules).",
+                      BooleanValue(true),
+                      MakeBooleanAccessor(&OlsrDefenseGcop::m_useFictitiousNodes),
                       MakeBooleanChecker());
     return tid;
 }
@@ -112,7 +130,8 @@ OlsrDefenseGcop::OlsrDefenseGcop()
       // harness's explicit SetAttribute("Enabled", false) at install time,
       // both hit the SetEnabled no-op guard -- by design.
       m_enabled(false),
-      m_enableTime(Seconds(0))
+      m_enableTime(Seconds(0)),
+      m_useFictitiousNodes(true)
 {
 }
 
@@ -227,6 +246,12 @@ bool OlsrDefenseGcop::RequiresFictitiousNode() {
     // defense's authentic on-air signature and is intentionally not gated
     // by the warmup -- faithful to the original, which had no such gate.)
     if (!m_enabled) {
+        return false;
+    }
+    // PAPER ALIGNMENT (C-Rules): when fictitious nodes are disabled we never
+    // advertise one. The three contradiction rules still run; only the
+    // GCOP/GCOHP fictitious-node decision is skipped.
+    if (!m_useFictitiousNodes) {
         return false;
     }
     // The paper recommends the GCOP + GCOHP combination: GCOP handles the
@@ -469,8 +494,10 @@ bool OlsrDefenseGcop::CheckRule1(Ipv4Address senderAddress, std::string& outReas
         if (twoHop.neighborMainAddr != senderAddress) continue;
         const Ipv4Address& claimedNeighbor = twoHop.twoHopNeighborAddr;
 
-        // (a) Bait detection - fires immediately, no count threshold
-        if (claimedNeighbor == fakeAddress) {
+        // (a) Bait detection - fires immediately, no count threshold.
+        //     Only meaningful when we actually advertise a fictitious node
+        //     (C-Rules mode skips it).
+        if (m_useFictitiousNodes && claimedNeighbor == fakeAddress) {
             outReason = "Rule 1a (Bait): claims link to our fictitious node";
             return true;
         }

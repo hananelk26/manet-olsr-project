@@ -272,6 +272,12 @@ class RoutingProtocol : public Ipv4RoutingProtocol
   private:
     std::map<Ipv4Address, RoutingTableEntry> m_table; //!< Data structure for the routing table.
 
+    /// PAPER ALIGNMENT (IMP): secondary routing table computed excluding all
+    /// currently-blacklisted nodes. Identical to m_table when the blacklist is
+    /// empty. Consulted ONLY at forward time by the IMP next-hop check; the
+    /// main table m_table is never poisoned in response to a suspicion.
+    std::map<Ipv4Address, RoutingTableEntry> m_tableAvoidingSuspects;
+
     Ptr<Ipv4StaticRouting> m_hnaRoutingTable; //!< Routing table for HNA routes
 
     EventGarbageCollector m_events; //!< Running events.
@@ -512,6 +518,29 @@ class RoutingProtocol : public Ipv4RoutingProtocol
      * @brief Creates the routing table of the node following \RFC{3626} hints.
      */
     void RoutingTableComputation();
+
+    /**
+     * @brief Core \RFC{3626} routing-table build, parameterised by a set of
+     * excluded nodes. Writes into m_table. Called by RoutingTableComputation()
+     * with an empty set (the standard main table) and with the current
+     * blacklist (the suspect-avoiding table). PAPER ALIGNMENT (IMP).
+     */
+    void ComputeRoutingTableCore(const std::set<Ipv4Address>& excluded);
+
+    /// Like Lookup(), but on an explicitly supplied table (IMP helper).
+    bool LookupIn(const std::map<Ipv4Address, RoutingTableEntry>& table,
+                  const Ipv4Address& dest,
+                  RoutingTableEntry& outEntry) const;
+
+    /// Like FindSendEntry(), but on an explicitly supplied table (IMP helper).
+    bool FindSendEntryIn(const std::map<Ipv4Address, RoutingTableEntry>& table,
+                         const RoutingTableEntry& entry,
+                         RoutingTableEntry& outEntry) const;
+
+    /// Resolve a suspect-avoiding send-entry to @p dest from
+    /// m_tableAvoidingSuspects. Returns false if no suspect-free route exists.
+    bool FindSuspectAvoidingSendEntry(const Ipv4Address& dest,
+                                      RoutingTableEntry& outEntry) const;
 
   public:
     /**
