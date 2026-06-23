@@ -2395,7 +2395,15 @@ main (int argc, char* argv[])
                 "(verification only; emits no CSV column)",
                 cfg.debugDefenseState);
 
+  bool useFictitiousNodes = true;
+  cmd.AddValue("useFictitiousNodes",
+             "DCFM fictitious-node injection (false = paper C-Rules)",
+             useFictitiousNodes);
+
   cmd.Parse (argc, argv);
+
+  Config::SetDefault("ns3::olsr::OlsrDefenseGcop::UseFictitiousNodes",
+                   BooleanValue(useFictitiousNodes));
 
   // ---- Special modes (no simulation) -------------------------------------
   if (cfg.emitHeaderOnly) EmitHeadersAndExit ();
