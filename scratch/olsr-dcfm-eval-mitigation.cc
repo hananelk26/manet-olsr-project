@@ -573,6 +573,24 @@ static uint32_t g_blacklistMaxSize   = 0;
 static ns3::olsreval::FeatureCollector g_features;
 static bool                        g_featuresActive = false;
 
+// ============================================================================
+// FEATURE OUTPUT MODE  (single source of truth for header AND rows)
+// ----------------------------------------------------------------------------
+// Selects which feature columns the features CSV (windows_features.csv) and the
+// --emit-header output contain. BOTH BuildFeaturesHeader() (the header) and the
+// per-window EmitFeatureCsv() (the rows) read THIS one constant, so the header
+// and the rows can never go out of sync. To switch: change the value below and
+// rebuild (./ns3 build). See FEATURE_MODE_USAGE.md for the full per-option guide.
+//
+//   FeatureMode::Core       group A-K only  (DEFAULT, 95 cols; byte-identical
+//                            to the pre-parity behaviour -- nothing changes).
+//   FeatureMode::CoreAndV2   A-K + strict_observable_v2 parity group L
+//                            (95 + 33 = 128 cols).
+//   FeatureMode::V2Only      only the parity group L (33 cols, named exactly
+//                            like defense_detection_v2.py's METRICS list).
+static const ns3::olsreval::FeatureCollector::FeatureMode FEATURE_MODE =
+    ns3::olsreval::FeatureCollector::FeatureMode::Core;
+
 // PHY-trace availability flag (OBS-002b / DEG-003).
 static bool g_phyTraceAvailable = false;
 
@@ -749,7 +767,7 @@ static std::string BuildFeaturesHeader ()
 {
   std::string h =
     "run_id,scenario,window_start,window_end,window_duration_s,";
-  h += ns3::olsreval::FeatureCollector::FeatureCsvHeader ();
+  h += ns3::olsreval::FeatureCollector::FeatureCsvHeader (FEATURE_MODE);
   return h;
 }
 
@@ -2007,7 +2025,7 @@ EndMeasurementWindow (const std::string& scenarioName,
   featRow << g_currentRun << ","
           << scenarioName << ","
           << windowStart << "," << windowEnd << "," << duration << ","
-          << g_features.EmitFeatureCsv (windowEnd)
+          << g_features.EmitFeatureCsv (windowEnd, FEATURE_MODE)
           << "\n";
   g_staging.featureRows.push_back (featRow.str ());
 

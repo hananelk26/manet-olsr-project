@@ -31,8 +31,12 @@ NS_OBJECT_ENSURE_REGISTERED(OlsrDefenseGcop);
 /// see the comment at the warmup check in EvaluateContradictionRules().
 /// Required because Rule 2 and Rule 3 read the topology set, which only
 /// converges after several TC cycles. HELLO=2s, TC=5s => ~9 TC
-/// opportunities in 45s. The DURATION is unchanged from the original.
-static const double WARMUP_SECONDS = 45.0;
+/// opportunities in 45s.
+/// PAPER-FAITHFUL: the paper evaluates the contradiction rules on every HELLO
+/// with no warmup; restored to 0.0 (original calibrated value was 45.0). With a
+/// not-yet-converged topology set Rule 2/3 may raise early false positives --
+/// the accepted cost of paper fidelity.
+static const double WARMUP_SECONDS = 0.0;
 
 /// How long a flagged node remains on the blacklist after the last triggering
 /// HELLO. The penalty is refreshed by every subsequent triggering HELLO, so
@@ -40,15 +44,17 @@ static const double WARMUP_SECONDS = 45.0;
 static const Time PENALTY_DURATION = Seconds(5.0);
 
 /// Number of consecutive violations required before adding to the blacklist.
-/// The reference DCFM implementation uses 1 (immediate flag). We use 2 to
-/// filter transient asymmetric-view artifacts from HELLO loss, at the cost
-/// of one extra HELLO period (~2s) of detection latency.
-static const uint32_t STRIKES_BEFORE_BLACKLIST = 2;
+/// PAPER-FAITHFUL: the reference DCFM flags on a single contradiction (immediate
+/// flag); restored to 1. (Original calibrated value was 2, to filter transient
+/// asymmetric-view artifacts from HELLO loss at the cost of ~2s latency.)
+static const uint32_t STRIKES_BEFORE_BLACKLIST = 1;
 
-/// Minimum size of (V \ ADJ(v)) required before Rule 3 may fire. Guards
-/// against false positives in toy topologies where a legitimate hub can
-/// trivially cover all non-1-hop nodes.
-static const size_t MIN_NETWORK_SIZE_FOR_RULE3 = 6;
+/// Minimum size of (V \ ADJ(v)) required before Rule 3 may fire.
+/// PAPER-FAITHFUL: the paper's Rule 3 ({V\ADJ(v)} subset-of ADJ(x)) has no
+/// minimum-size floor; restored to 1, which keeps only the degenerate
+/// empty-set guard. (Original calibrated value was 6, to suppress toy-topology
+/// hubs.)
+static const size_t MIN_NETWORK_SIZE_FOR_RULE3 = 1;
 
 /// Minimum number of uncovered 2-hop nodes required to fire Rule 2.
 /// Rule 2 has an inherent false-positive tendency in sparse OLSR networks:
@@ -59,7 +65,7 @@ static const size_t MIN_NETWORK_SIZE_FOR_RULE3 = 6;
 /// not select each other as MPRs). An actual link-spoofing attacker, in
 /// contrast, claims N distant nodes that are completely unreachable
 /// through any of its legitimate MPRs, producing many uncovered.
-static const size_t MIN_UNCOVERED_FOR_RULE2 = 5;
+static const size_t MIN_UNCOVERED_FOR_RULE2 = 1; // PAPER-FAITHFUL: paper fires on a single uncovered 2-hop node (was 5).
 
 /// Minimum number of asymmetric link claims required to fire Rule 1b.
 /// Rule 1b looks for sender X claiming "Z is my neighbor" while Z's HELLO
@@ -68,7 +74,7 @@ static const size_t MIN_UNCOVERED_FOR_RULE2 = 5;
 /// typical loss). Requiring 2+ asymmetric claims distinguishes a
 /// link-spoofing attacker (multiple consistent lies) from a transient
 /// HELLO-loss artifact (one isolated discrepancy).
-static const size_t MIN_ASYMMETRY_FOR_RULE1B = 2;
+static const size_t MIN_ASYMMETRY_FOR_RULE1B = 1; // PAPER-FAITHFUL: paper Rule 1 fires on a single asymmetry (was 2).
 
 /// Enable filtering of TC tuples from blacklisted originators in Rule 2.
 /// When the contradiction rules have low FP rate (e.g., after applying
@@ -772,6 +778,16 @@ bool OlsrDefenseGcop::RunGcopAlgorithm() {
 
     const auto& neighbors       = m_routingProtocol->GetNeighbors();
     const auto& twoHopNeighbors = m_routingProtocol->GetTwoHopNeighbors();
+    // BUGFIX: the topology set is needed to recover blue<->blue (and the
+    // remaining green<->green) edges of G_2. The two-hop set only encodes
+    // green<->blue and green<->green (1-hop) edges; it NEVER encodes an edge
+    // between two blue (2-hop) nodes, because every two-hop tuple has a 1-hop
+    // neighbor on one side. Without blue<->blue edges the depth-2 BFS below
+    // can only reach a blue at distance 1 from g (a blue reachable solely via
+    // g->b'->b would be missed), so Eq. (6) was being under-satisfied and GCOP
+    // emitted fewer fictitious nodes than the paper specifies. GCOHP already
+    // augments its graph with these topology edges; GCOP must do the same.
+    const auto& topology        = m_routingProtocol->GetTopologySet();
 
     // Step 1: build green (ADJ(s)) and blue (ADJ2(s)) sets ---------------------
     std::set<Ipv4Address> greens;
@@ -799,6 +815,11 @@ bool OlsrDefenseGcop::RunGcopAlgorithm() {
 
     // Step 2: build the subgraph G_2 over green + blue only --------------------
     // The graph deliberately excludes s, so paths cannot loop through us.
+    // Edges come from TWO sources so that all of E_2 (the edges of G restricted
+    // to green+blue) is recovered, matching the graph GCOHP builds:
+    //   - the two-hop set  -> green<->blue and green<->green edges, and
+    //   - the topology set -> blue<->blue (and additional green<->green) edges
+    //     that are invisible to the two-hop set.
     std::set<Ipv4Address> allowedNodes;
     allowedNodes.insert(greens.begin(), greens.end());
     allowedNodes.insert(blues.begin(), blues.end());
@@ -810,6 +831,16 @@ bool OlsrDefenseGcop::RunGcopAlgorithm() {
     for (const auto& th : twoHopNeighbors) {
         const Ipv4Address& u = th.neighborMainAddr;
         const Ipv4Address& v = th.twoHopNeighborAddr;
+        if (allowedNodes.count(u) && allowedNodes.count(v)) {
+            graph[u].insert(v);
+            graph[v].insert(u);
+        }
+    }
+    // BUGFIX (see note at the top of this function): fold in topology-set edges
+    // so that blue<->blue adjacencies contribute to the depth-2 reachability.
+    for (const auto& tp : topology) {
+        const Ipv4Address& u = tp.lastAddr;
+        const Ipv4Address& v = tp.destAddr;
         if (allowedNodes.count(u) && allowedNodes.count(v)) {
             graph[u].insert(v);
             graph[v].insert(u);

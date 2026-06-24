@@ -1,100 +1,3 @@
-/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
-// ============================================================================
-// olsr_window_features.h -- Window-level observable-feature collector
-//                           (defense-agnostic; shared by every OLSR
-//                            defense-evaluation harness)
-// ============================================================================
-//
-// THIS FILE IS A POST-AUDIT REWRITE. See CHANGELOG block below.
-//
-// ----------------------------------------------------------------------------
-// CHANGELOG (Phase 2)
-// ----------------------------------------------------------------------------
-// Approved findings implemented:
-//   BUG-001: ANSN delta uses modular (uint16) arithmetic.
-//   BUG-002: EdgeDisappearanceRate redefined within-window
-//            -> EdgeChurnWithinWindowRate.
-//   BUG-003: EdgeAppearanceRate redefined within-window
-//            -> EdgeEmergenceWithinWindowRate.
-//   BUG-005: AdvertisedRadius init fixed (numeric_limits<int>::max()).
-//   BUG-007: cycle counter dead `depth==1` branch removed; correctness
-//            covered by --self-test in the harness.
-//   DEG-001: removed C3 (NumDistinctDataSenderAddresses), E3 (HopCountP95),
-//            E5 (NumDistinctSourceDestinationPairsObserved),
-//            E6 (PacketArrivalRatePerFlow), G5 (E2ELatencyP95),
-//            G9 (ThroughputStdAcrossFlows), I3 (DataSenderAddressEntropy).
-//   DEG-002: TC payload byte stream uses last octet only;
-//            ControlMessagePayloadCompressibility (I6) removed.
-//   DEG-003: F1-F8 gated on m_phyAvailable; emit 0 when PHY trace failed.
-//   DEG-004: removed E3 ObservedHopCountP95, G5 EndToEndLatencyP95.
-//   MIS-001: Layer2RetransmissionRate denominator now total observed
-//            non-HELLO data frames in the window.
-//   MIS-002: F11 (CollisionRate) and F12 (UnAcknowledgedReceptionCount)
-//            removed permanently.
-//   OBS-002/003/004/005/006: collection-side API changed to accept
-//            on-air-derived inputs (ObserveDataSentOnAir,
-//            ObserveDataDeliveredOnAir, ObserveMacFrame).
-//
-// ----------------------------------------------------------------------------
-// CHANGELOG (schema v3 -- observability tightening)
-// ----------------------------------------------------------------------------
-//   OBS-007: RTS/CTS/ACK-derived features removed. RTS, CTS and ACK are
-//            1-hop MAC control frames with the same observability limit as
-//            HELLO, so a remote passive attacker cannot reliably sniff
-//            them. Removed columns: RtsRateLocal, CtsRateLocal,
-//            AckRateLocal, AckDelayMean, AckDelayStd (F-group 8 -> 3;
-//            total 86 -> 81). ObserveMacFrame() loses its
-//            isRts/isCts/isAck parameters; the caller must now filter
-//            RTS/CTS/ACK out (alongside HELLO) before calling.
-//            Layer2RetransmissionRate (retry bit read from the data
-//            frame's own header), ChannelBusyTimeFraction and
-//            InterFrameSpacingMean are retained: with the caller-side
-//            filter in place they accumulate over observable frames only.
-//            HEADER_VERSION bumped 2 -> 3 in all harnesses.
-//
-// CHANGELOG (schema v4 -- defense-detection breadth features, FEAT-008)
-// ----------------------------------------------------------------------------
-//   FEAT-008: Added 14 passively-observable columns (group K) targeting
-//             defense-induced TC-propagation suppression and DATA-side
-//             reroute breadth. All are fed exclusively from the on-air
-//             PHY sniffer (transmitter = MAC Addr2, next-hop = MAC Addr1),
-//             never from 1-hop or node-internal state.
-//             Group A (TC suppression, distribution stats across nodes):
-//               TcOriginationCount{Min,Mean,Std,Max},
-//               TcRelayerBreadth{Min,Mean,Std,Max},
-//               TcMaxHopReach{Min,Mean,Std,Max}  (12 cols).
-//             Group B (DATA isolation breadth, single raw value each):
-//               DistinctForwardersChangingNextHop,
-//               NumDistinctNextHopsObservedNetworkwide  (2 cols).
-//             New observers: ObserveTcRelayOnAir(), ObserveDataForwardOnAir().
-//             Columns appended at the end of the schema (positions 82-95);
-//             all pre-existing columns keep their value and position.
-//             HEADER_VERSION bumped 3 -> 4 in all harnesses.
-//
-// Public API summary (post-rewrite):
-//   void   Reset(double tStart)
-//   void   ObserveTc(senderIface, originator, msg, tc, msgSize)
-//   void   ObserveMid(originator, msgSize)
-//   void   ObserveHna(originator, msgSize)
-//   void   ObserveDataSentOnAir(src, dst, bytes, now)
-//   void   ObserveDataDeliveredOnAir(src, dst, ttlAtDest, latency,
-//                                    firstHopMac, now)
-//   void   ObserveMacFrame(now, durationSec, isData, isRetry)
-//                          [only call AFTER HELLO and RTS/CTS/ACK
-//                           filtering (OBS-001 / OBS-007)]
-//   void   ObserveDataFrameOnAir() [counts a non-HELLO data MSDU
-//                                   observed on the medium, for
-//                                   Layer2RetransmissionRate denom]
-//   void   ObserveTcRelayOnAir(originator, msgSeq, hopCount, txMac)
-//   void   ObserveDataForwardOnAir(forwarderMac, nextHopMac, dst)
-//   void   SetPhyAvailable(bool)
-//   static std::string FeatureCsvHeader()
-//   std::string EmitFeatureCsv(double tEnd)
-//
-// Total observable feature columns emitted: 95.
-//
-// ----------------------------------------------------------------------------
-
 #ifndef OLSR_WINDOW_FEATURES_H
 #define OLSR_WINDOW_FEATURES_H
 
@@ -236,6 +139,15 @@ inline double HurstRS (const std::vector<double>& x)
 class FeatureCollector
 {
 public:
+  // ----------------------- Output mode selection ---------------------------
+  // Selects which feature block(s) EmitFeatureCsv()/FeatureCsvHeader() output.
+  //   Core      : groups A-K only  (DEFAULT; the v2 parity group is ignored).
+  //   V2Only    : only the strict_observable_v2 parity group (L).
+  //   CoreAndV2 : everything -- groups A-K followed by the parity group (L).
+  // Header and row stay in lock-step as long as the SAME mode value is passed
+  // to both FeatureCsvHeader() and EmitFeatureCsv().
+  enum class FeatureMode { Core, V2Only, CoreAndV2 };
+
   // ------------------------- Per-window reset ------------------------------
   void Reset (double tStart)
   {
@@ -290,6 +202,14 @@ public:
     m_dataDeliveredByFlow.clear ();
     m_jitterSamples.clear ();
     m_lastArrivalPerFlow.clear ();
+
+    // L-group (strict_observable_v2 parity): per-flow accumulators.
+    m_flowFirstTxTime.clear ();
+    m_flowLastTxTime.clear ();
+    m_flowTxBytes.clear ();
+    m_flowDelays.clear ();
+    m_flowJitters.clear ();
+
     m_tcInterArrivalsPerSender.clear ();
     m_lastTcTimeBySender.clear ();
     m_controlMessageTimes.clear ();
@@ -457,6 +377,13 @@ public:
     m_sourceDestPairs.emplace (src, dst);
     m_dataSentByFlow[{src, dst}]++;
     m_packetSizes.push_back (bytes);
+
+    // L-group: per-flow tx accumulators (first/last tx time, tx bytes).
+    const std::pair<Ipv4Address, Ipv4Address> fk (src, dst);
+    if (m_flowFirstTxTime.find (fk) == m_flowFirstTxTime.end ())
+      m_flowFirstTxTime[fk] = now;
+    m_flowLastTxTime[fk] = now;
+    m_flowTxBytes[fk] += bytes;
   }
 
   void ObserveDataDeliveredOnAir (Ipv4Address src, Ipv4Address dst,
@@ -483,9 +410,12 @@ public:
     auto itLast = m_lastArrivalPerFlow.find (key);
     if (itLast != m_lastArrivalPerFlow.end ())
       {
-        m_jitterSamples.push_back (std::abs (latencySec - itLast->second));
+        const double jitterSample = std::abs (latencySec - itLast->second);
+        m_jitterSamples.push_back (jitterSample);
+        m_flowJitters[key].push_back (jitterSample);   // L-group per-flow jitter
       }
     m_lastArrivalPerFlow[key] = latencySec;
+    m_flowDelays[key].push_back (latencySec);           // L-group per-flow delay
 
     // BUG-004: first-hop MAC tracking. The caller passes the MAC of the
     // first relay (the second on-air transmitter of the same IP-id).
@@ -573,7 +503,7 @@ public:
   }
 
   // -------------------------- Snapshot -------------------------------------
-  static std::string FeatureCsvHeader ()
+  static std::string CoreFeatureCsvHeader ()
   {
     return
       // A. Control traffic volume (11)
@@ -631,7 +561,38 @@ public:
       "DistinctForwardersChangingNextHop,NumDistinctNextHopsObservedNetworkwide";
   }
 
-  std::string EmitFeatureCsv (double tEnd)
+  // ----- strict_observable_v2 parity group (L): 33 columns. ----------------
+  // Names and order match defense_detection_v2.py's METRICS list so the
+  // existing v2 ML pipeline can consume these columns directly.
+  static std::string V2FeatureCsvHeader ()
+  {
+    return
+      "TcMessageRate,MidMessageRate,HnaMessageRate,"
+      "AverageAdvertisedLinksPerTCMessage,"
+      "NormalizedRoutingLoad,RoutingOverheadRatio,RoutingOverheadBytesRatio,"
+      "PacketDeliveryRatio,PacketLossRatio,AverageEndToEndDelay,AverageJitter,"
+      "Throughput,AverageHopCount,DataPacketRate,RxTxPacketRatio,"
+      "FlowCount,AvgFlowDuration,FlowDurationStd,AvgFlowThroughput,"
+      "AvgFlowDelay,AvgFlowJitter,AvgFlowLossRate,"
+      "FlowThroughputStd,FlowDelayStd,FlowJitterStd,FlowLossRateStd,"
+      "AvgTxBytesPerFlow,AvgRxBytesPerFlow,AvgTxPacketsPerFlow,AvgRxPacketsPerFlow,"
+      "AvgTxPacketSize,AvgRxPacketSize,AverageMprCount";
+  }
+
+  // Mode-aware header. Defaults to FeatureMode::Core, so existing callers that
+  // call FeatureCsvHeader() keep emitting groups A-K unchanged.
+  static std::string FeatureCsvHeader (FeatureMode mode = FeatureMode::Core)
+  {
+    switch (mode)
+      {
+      case FeatureMode::V2Only:    return V2FeatureCsvHeader ();
+      case FeatureMode::CoreAndV2: return CoreFeatureCsvHeader () + "," + V2FeatureCsvHeader ();
+      case FeatureMode::Core:
+      default:                     return CoreFeatureCsvHeader ();
+      }
+  }
+
+  std::string EmitFeatureCsv (double tEnd, FeatureMode mode = FeatureMode::Core)
   {
     m_winEnd = tEnd;
     const double dur = std::max (1e-6, m_winEnd - m_winStart);
@@ -1133,7 +1094,90 @@ public:
       << "," << distinctForwardersChangingNextHop
       << "," << numDistinctNextHopsNetworkwide;
 
-    return r.str ();
+    // ----- Mode Core: emit groups A-K exactly as before. -----------------
+    if (mode == FeatureMode::Core)
+      return r.str ();
+
+    // === L. strict_observable_v2 parity features (33) ====================
+    // Re-implements the metric set consumed by defense_detection_v2.py,
+    // adapted to this strictly-passive collector. Metrics that originally
+    // read node-internal state use an on-air observable analog (noted):
+    //   - NormalizedRoutingLoad / RoutingOverhead* : HELLO is excluded (not
+    //     observable); routing traffic = TC+MID+HNA only.
+    //   - AverageMprCount : mean in-degree of advertised nodes in the directed
+    //     TC graph (node X chose sender S as MPR iff X in adv(S)).
+    //   - AvgRxBytesPerFlow : delivered-packets * mean sent packet size of the
+    //     flow (per-flow delivered bytes are not separately observable).
+    const double L_routingMsgs  = static_cast<double> (m_tcCount + m_midCount + m_hnaCount);
+    const double L_routingBytes = static_cast<double> (m_tcBytes + m_midBytes + m_hnaBytes);
+    const double L_dataPkts     = static_cast<double> (m_dataPackets);
+    const double L_dataBytes    = static_cast<double> (m_dataBytes);
+
+    const double L_pdr = (pktsSent > 0)
+        ? static_cast<double> (pktsDelivered) / static_cast<double> (pktsSent) : 0.0;
+    const double L_nrl = (pktsDelivered > 0)
+        ? L_routingMsgs / static_cast<double> (pktsDelivered) : 0.0;
+    const double L_overheadRatio = (L_routingMsgs + L_dataPkts > 0.0)
+        ? L_routingMsgs / (L_routingMsgs + L_dataPkts) : 0.0;
+    const double L_overheadBytesRatio = (L_routingBytes + L_dataBytes > 0.0)
+        ? L_routingBytes / (L_routingBytes + L_dataBytes) : 0.0;
+
+    // Per-flow distributions (keyed by observed (src,dst)).
+    std::vector<double> fDur, fThr, fDelay, fJit, fLoss, fTxB, fRxB, fTxP, fRxP;
+    for (const auto& kv : m_dataSentByFlow)
+      {
+        const auto& fkey = kv.first;
+        const double txPk = static_cast<double> (kv.second);
+        fTxP.push_back (txPk);
+        auto itRx = m_dataDeliveredByFlow.find (fkey);
+        const double rxPk = (itRx != m_dataDeliveredByFlow.end ())
+            ? static_cast<double> (itRx->second) : 0.0;
+        fRxP.push_back (rxPk);
+        auto itB = m_flowTxBytes.find (fkey);
+        const double txB = (itB != m_flowTxBytes.end ())
+            ? static_cast<double> (itB->second) : 0.0;
+        fTxB.push_back (txB);
+        const double meanPkt = (txPk > 0.0) ? txB / txPk : 0.0;
+        fRxB.push_back (rxPk * meanPkt);
+        double fd = 0.0;
+        auto itF = m_flowFirstTxTime.find (fkey);
+        auto itL = m_flowLastTxTime.find (fkey);
+        if (itF != m_flowFirstTxTime.end () && itL != m_flowLastTxTime.end ())
+          fd = std::max (0.0, itL->second - itF->second);
+        fDur.push_back (fd);
+        fThr.push_back ((fd > 0.0) ? (txB * 8.0) / fd : 0.0);
+        auto itD = m_flowDelays.find (fkey);
+        fDelay.push_back ((itD != m_flowDelays.end ()) ? Mean (itD->second) : 0.0);
+        auto itJ = m_flowJitters.find (fkey);
+        fJit.push_back ((itJ != m_flowJitters.end ()) ? Mean (itJ->second) : 0.0);
+        fLoss.push_back ((txPk > 0.0) ? std::max (0.0, 1.0 - rxPk / txPk) : 0.0);
+      }
+
+    const double L_avgMprCount = (!m_addressesSeenInTcPayload.empty ())
+        ? static_cast<double> (m_observedDirectedEdges.size ())
+          / static_cast<double> (m_addressesSeenInTcPayload.size ()) : 0.0;
+
+    std::ostringstream rl;
+    rl << std::fixed << std::setprecision (6);
+    rl << tcRate << "," << midRate << "," << hnaRate << ","
+       << advLnkMean << ","
+       << L_nrl << "," << L_overheadRatio << "," << L_overheadBytesRatio << ","
+       << L_pdr << "," << (1.0 - L_pdr) << "," << e2eMean << "," << jMean << ","
+       << throughputBps << "," << hopMean << "," << dataPRate << "," << L_pdr << ","
+       << static_cast<double> (m_dataSentByFlow.size ()) << ","
+       << Mean (fDur) << "," << Std (fDur) << "," << Mean (fThr) << ","
+       << Mean (fDelay) << "," << Mean (fJit) << "," << Mean (fLoss) << ","
+       << Std (fThr) << "," << Std (fDelay) << "," << Std (fJit) << "," << Std (fLoss) << ","
+       << Mean (fTxB) << "," << Mean (fRxB) << "," << Mean (fTxP) << "," << Mean (fRxP) << ","
+       << ((m_dataPackets > 0) ? L_dataBytes / L_dataPkts : 0.0) << ","
+       << ((pktsDelivered > 0) ? static_cast<double> (m_dataDeliveredBytes)
+                                 / static_cast<double> (pktsDelivered) : 0.0) << ","
+       << L_avgMprCount;
+
+    if (mode == FeatureMode::V2Only)
+      return rl.str ();
+    // CoreAndV2: groups A-K, then the parity group.
+    return r.str () + "," + rl.str ();
   }
 
   // ----- Public test hooks (used by harness --self-test) -------------------
@@ -1186,6 +1230,13 @@ private:
   std::map<std::pair<Ipv4Address, Ipv4Address>, double>   m_lastArrivalPerFlow;
   std::vector<double> m_dataLatencies;
   std::vector<double> m_jitterSamples;
+
+  // L-group (strict_observable_v2 parity): per-flow accumulators.
+  std::map<std::pair<Ipv4Address, Ipv4Address>, double>   m_flowFirstTxTime;
+  std::map<std::pair<Ipv4Address, Ipv4Address>, double>   m_flowLastTxTime;
+  std::map<std::pair<Ipv4Address, Ipv4Address>, uint64_t> m_flowTxBytes;
+  std::map<std::pair<Ipv4Address, Ipv4Address>, std::vector<double>> m_flowDelays;
+  std::map<std::pair<Ipv4Address, Ipv4Address>, std::vector<double>> m_flowJitters;
 
   // BUG-004: first-hop-MAC-churn observable replacement for next-hop.
   std::map<Ipv4Address, std::set<Mac48Address>> m_firstHopMacsPerSrc;
