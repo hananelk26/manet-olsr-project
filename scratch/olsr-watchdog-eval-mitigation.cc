@@ -568,7 +568,7 @@ static bool                        g_featuresActive = false;
 //   FeatureMode::V2Only      only the parity group L (33 cols, named exactly
 //                            like defense_detection_v2.py's METRICS list).
 static const ns3::olsreval::FeatureCollector::FeatureMode FEATURE_MODE =
-    ns3::olsreval::FeatureCollector::FeatureMode::V2Only;
+    ns3::olsreval::FeatureCollector::FeatureMode::CoreAndV2;
 
 // PHY-trace availability flag (OBS-002b / DEG-003).
 static bool g_phyTraceAvailable = false;
