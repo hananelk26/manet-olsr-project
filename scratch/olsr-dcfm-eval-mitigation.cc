@@ -81,7 +81,20 @@
  *            GEN-003); the runs.csv HEADER and column set are byte-for-byte
  *            identical (HEADER_VERSION still 2).
  *   DEF-005: the --debugDefenseState print is adapted to the DCFM state
- *            containers (suspiciousNodes, violationCounter).
+ *            container (riskyNodes; the reference-DCFM revert removed the
+ *            former suspiciousNodes/violationCounter penalty machinery).
+ *   PROF-PORT (reference-DCFM revert): SUPERSEDES the warmup/penalty/strike
+ *            descriptions in DEF-003/DEF-005/WBR-001 above. The defense was
+ *            aligned byte-faithfully to the reference DCFM: detection is now
+ *            instantaneous per HELLO (no warmup, no penalty window, no strike
+ *            counter -- the only accumulated container is the risky set); the
+ *            three contradiction rules use their reference form (Rule 1 tests
+ *            ANY neighbor; no uncovered/asymmetry/network-size thresholds; no
+ *            topology filtering); the fictitious-node decision is GCOHP-only;
+ *            and MPR uses "not the sole MPR". The cold start therefore clears
+ *            only the risky set, and defense_params.txt reflects these values.
+ *            Any "45 s warmup" / "2-strike" / "5 s penalty" mention above is
+ *            historical and no longer in effect.
  *   Timeline, acceptance gates, seeding, trace hooks, the 86-feature
  *   collection (olsr_window_features.h untouched), the five CSV tables and the
  *   forced RTS/CTS are all byte-identical to the Watchdog/FPNT harnesses.
@@ -1765,20 +1778,18 @@ ResetOlsrCounters ()
 // stabilization period) we force every node's DCFM (OlsrDefenseGcop) object
 // back to its freshly-loaded state -- unconditionally, regardless of whether
 // the (attack,defense) state changed between the previous slot and this one.
-// This closes the cross-window leakage channel through defense-INTERNAL state
-// (the time-windowed blacklist m_suspiciousNodes and the 2-strike
-// consecutive-violation counters m_violationCounter; the warmup anchor
-// m_enableTime is re-armed on the enable leg). Without it, two consecutive
-// defense-enabled slots would let the second inherit the blacklist/strikes the
-// first built up, so the observable features would depend on window history
+// This closes the cross-window leakage channel through defense-INTERNAL state.
+// PROF PORT / REFERENCE DCFM: the only accumulated container is now the
+// instantaneous risky set (m_riskyNodes); the former time-windowed blacklist,
+// 2-strike counters and warmup anchor were removed. Without the reset, two
+// consecutive defense-enabled slots could let the second inherit risky flags
+// the first built up, so the observable features would depend on window history
 // rather than on the scenario alone. Performing the reset at the transition
 // (not at the measurement-window start) gives the defense the full 60 s
-// stabilization window to re-warm (45 s topology-convergence warmup + ~4 s
-// two-strike detection + enforcement and OLSR re-convergence complete by
-// ~t0+51..56 s), so the measurement window observes a fully-warmed defense
-// exhibiting its genuine, paper-faithful steady state (including its
-// authentic ~8-10 s blacklist oscillation under sustained attack: 5 s
-// un-refreshed penalty -> <=1 s GC -> ~2-4 s two-strike re-detection).
+// stabilization window to re-converge; because detection is now instantaneous
+// (recomputed on every HELLO with no warmup or penalty), the measurement window
+// observes the defense's genuine steady state once the topology set has
+// converged (a few TC cycles into the stabilization window).
 //
 // Mechanism: OlsrDefenseGcop::SetEnabled() performs a FULL SYMMETRIC
 // cold-start reset on every REAL state transition (a value-preserving call is
@@ -1824,17 +1835,17 @@ ForceDefenseColdStart ()
 // container across all nodes and prints one line. Called immediately AFTER the
 // cold start, so every value MUST read zero; any non-zero value is direct
 // evidence of a leak through defense state. Off unless --debugDefenseState.
-// DEF-005: adapted to the DCFM state inventory -- exactly two containers,
-// m_suspiciousNodes (time-windowed blacklist) and m_violationCounter
-// (2-strike counters); sizes are RAW container sizes via GetDebugStateSizes()
-// (not gated on Enabled), so zero here means a genuinely empty object.
+// DEF-005 / PROF PORT: after the reference-DCFM revert there is exactly ONE
+// accumulated-state container, m_riskyNodes (the instantaneous set of
+// currently-flagged senders). The former m_suspiciousNodes (time-windowed
+// blacklist) and m_violationCounter (2-strike counters) were removed with the
+// penalty/strike machinery, so GetDebugStateSizes() now reports riskyNodes.
 static void
 PrintDefenseStateSizes ()
 {
   if (g_simNodes == nullptr) return;
   std::size_t enabledNodes = 0;
-  std::size_t sumSusp = 0, maxSusp = 0;
-  std::size_t sumViol = 0, maxViol = 0;
+  std::size_t sumRisky = 0, maxRisky = 0;
   for (uint32_t i = 0; i < g_simNodes->GetN (); ++i)
     {
       Ptr<olsr::RoutingProtocol> proto = GetOlsrProtocol (g_simNodes->Get (i));
@@ -1847,15 +1858,12 @@ PrintDefenseStateSizes ()
       if (!def) continue;
       if (def->GetEnabled ()) ++enabledNodes;
       const olsr::OlsrDefenseGcop::DebugStateSizes s = def->GetDebugStateSizes ();
-      sumSusp += s.suspiciousNodes;
-      maxSusp  = std::max (maxSusp, s.suspiciousNodes);
-      sumViol += s.violationCounter;
-      maxViol  = std::max (maxViol, s.violationCounter);
+      sumRisky += s.riskyNodes;
+      maxRisky  = std::max (maxRisky, s.riskyNodes);
     }
   std::cout << "[defense_state @ t=" << Simulator::Now ().GetSeconds () << "s]"
             << " enabled_nodes=" << enabledNodes
-            << " suspiciousNodes(sum=" << sumSusp << ",max=" << maxSusp << ")"
-            << " violationCounter(sum=" << sumViol << ",max=" << maxViol << ")"
+            << " riskyNodes(sum=" << sumRisky << ",max=" << maxRisky << ")"
             << "  [expect all 0 right after cold start]" << std::endl;
 }
 
@@ -2253,17 +2261,25 @@ WriteDefenseParamsOnce (const SimulationConfig& cfg)
     {
       std::ostringstream os;
       os << "# Effective defense parameters (provenance; not an ML input).\n"
-         << "# DCFM tunables are hardcoded module constants (not ns-3 attributes); mirrored here.\n"
+         << "# PROF PORT / REFERENCE DCFM: the detection logic is byte-faithful to the\n"
+         << "# reference implementation. The former warmup / penalty / strike machinery\n"
+         << "# and the rule tuning constants were REMOVED; a sender is flagged the instant\n"
+         << "# it violates a contradiction rule on its latest HELLO and cleared on the next\n"
+         << "# clean HELLO. Values below describe the reference behavior now in effect.\n"
          << "harness_version=" << HARNESS_VERSION << "\n"
          << "header_version=" << HEADER_VERSION << "\n"
          << "defense_variant=DCFM-OLSR\n"
-         << "warmup_seconds=45.0\n"
-         << "penalty_duration_s=5\n"
-         << "strikes_before_blacklist=2\n"
-         << "min_uncovered_for_rule2=5\n"
-         << "min_asymmetry_for_rule1b=2\n"
-         << "min_network_size_for_rule3=6\n"
-         << "enable_topology_filter=true\n";
+         << "detection_model=instantaneous_per_hello\n"
+         << "warmup_seconds=0\n"
+         << "penalty_duration_s=0\n"
+         << "strikes_before_blacklist=1\n"
+         << "min_uncovered_for_rule2=1\n"
+         << "min_asymmetry_for_rule1b=1\n"
+         << "min_network_size_for_rule3=0\n"
+         << "enable_topology_filter=false\n"
+         << "rule1_neighbor_test=any_neighbor\n"
+         << "fictitious_decision=gcohp_only\n"
+         << "mpr_policy=not_the_sole_mpr\n";
       const std::string s = os.str ();
       ssize_t w = write (fd, s.c_str (), s.size ());
       (void) w;
@@ -2600,29 +2616,26 @@ main (int argc, char* argv[])
   g_clientIp = interfaces.GetAddress (UDP_CLIENT_NODE_ID);
 
   // ----- 5. Install DCFM defense (initially DISABLED) ----------------------
-  // DCFM: C-Rules contradiction detection + GCOP/GCOHP fictitious-node
-  // decision + IMP enforcement (Schweitzer et al., Computer Communications
-  // 2024). DEF-003: unlike FPNT/Watchdog, every DCFM tunable is a HARDCODED
-  // file-constant inside olsr-defense-gcop.cc (not an ns-3 attribute), so
-  // the ONLY attribute the harness sets is Enabled=false. Effective
-  // constants for provenance:
-  //   WARMUP_SECONDS             = 45.0  (re-anchored to each ON transition)
-  //   PENALTY_DURATION           = 5 s   (not refreshed while blacklisted)
-  //   STRIKES_BEFORE_BLACKLIST   = 2
-  //   MIN_UNCOVERED_FOR_RULE2    = 5
-  //   MIN_ASYMMETRY_FOR_RULE1B   = 2
-  //   MIN_NETWORK_SIZE_FOR_RULE3 = 6
-  //   ENABLE_TOPOLOGY_FILTER     = true
-  // Timing budget under option C (reset at the slot transition): 45 s warmup
-  // + ~4 s two-strike detection + enforcement and OLSR re-convergence finish
-  // by ~t0+51..56 s, comfortably inside the 60 s stabilization period, so
-  // the measurement window observes the defense's authentic steady state
-  // (including its genuine ~8-10 s blacklist oscillation under sustained
-  // attack). The fictitious-node injection (HELLO + TC) is queried
-  // per-message by the RoutingProtocol and starts as soon as the defense is
-  // enabled; when ON it is the defense's authentic on-air signature -- NOT a
-  // state leak -- and when OFF the strategy returns false so OFF windows are
-  // baseline-clean on the air.
+  // DCFM: C-Rules contradiction detection + GCOHP fictitious-node decision +
+  // IMP enforcement (Schweitzer et al., Computer Communications 2024).
+  // DEF-003: the ONLY attribute the harness sets is Enabled=false.
+  // PROF PORT / REFERENCE DCFM -- effective behavior for provenance:
+  //   detection      = instantaneous per-HELLO (no warmup, no penalty window,
+  //                    no strike counter); a sender is risky iff it violates a
+  //                    rule on its latest HELLO, cleared on the next clean one.
+  //   Rule 1         = asymmetry on ANY neighbor + ungated fictitious-node bait
+  //   Rule 2         = MPR-coverage; any uncovered 2-hop -> risky (no threshold,
+  //                    no topology filtering)
+  //   Rule 3         = over-coverage; |reachable| >= |netTargets| (no size floor)
+  //   fictitious     = GCOHP (hexagon) only
+  //   MPR policy     = "not the sole MPR" (suspect kept; one clean backup only
+  //                    if every selected MPR is suspect)
+  // Because detection is instantaneous, the measurement window observes the
+  // defense's genuine steady state once the topology set has converged (a few
+  // TC cycles into the 60 s stabilization period). The fictitious-node
+  // injection (HELLO + TC) is queried per-message by the RoutingProtocol; when
+  // ON it is the defense's authentic on-air signature -- NOT a state leak --
+  // and when OFF the strategy returns false so OFF windows are baseline-clean.
   for (uint32_t i = 0; i < nodes.GetN (); ++i)
     {
       Ptr<olsr::RoutingProtocol> proto = GetOlsrProtocol (nodes.Get (i));

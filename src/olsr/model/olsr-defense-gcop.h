@@ -88,11 +88,9 @@ public:
      *
      * Symmetric cold start: EVERY real transition -- enable->disable AND
      * disable->enable -- wipes all accumulated detection state
-     * (m_suspiciousNodes, m_violationCounter) and, on the enable leg,
-     * re-anchors the warmup window (m_enableTime = Simulator::Now()). The
-     * harness's ForceDefenseColdStart() double-toggle therefore always
-     * produces exactly two real transitions and a guaranteed full wipe,
-     * restoring the slot's intended ON/OFF value.
+     * (m_riskyNodes). The harness's ForceDefenseColdStart() double-toggle
+     * therefore always produces exactly two real transitions and a guaranteed
+     * full wipe, restoring the slot's intended ON/OFF value.
      *
      * Wipes ONLY defense-owned state; the Setup() wiring
      * (m_routingProtocol, m_mainAddress) is intentionally untouched.
@@ -113,8 +111,7 @@ public:
      */
     struct DebugStateSizes
     {
-        std::size_t suspiciousNodes;  //!< |m_suspiciousNodes| (incl. expired entries)
-        std::size_t violationCounter; //!< |m_violationCounter| (incl. zero-valued entries)
+        std::size_t riskyNodes;  //!< |m_riskyNodes| (currently-flagged senders)
     };
     DebugStateSizes GetDebugStateSizes() const;
     // ======================================================================
@@ -208,21 +205,18 @@ private:
     double m_startTime;                   //!< Sim time at which Setup() was called.
 
     /**
-     * \brief Blacklist: address -> expiration time.
-     *        Entries are pruned by PeriodicCheck() once now > expiration.
-     */
-    std::map<Ipv4Address, Time> m_suspiciousNodes;
-
-    /**
-     * \brief Consecutive-violation counter (2-strike policy).
+     * \brief Currently-flagged senders (reference DCFM, instantaneous).
      *
-     * Increments on every isRisky=true and resets to 0 on isRisky=false.
-     * Blacklist is applied only when the count reaches the configured
-     * strike threshold, which filters out one-shot transient violations
-     * (e.g., a single asymmetric-view contradiction caused by a HELLO
-     * lost over a marginal MAC link).
+     * PROF PORT: replaces the previous time-windowed blacklist
+     * (m_suspiciousNodes) + strike counter (m_violationCounter). Reference
+     * DCFM has no penalty window and no strike threshold: a sender is flagged
+     * iff it violates a contradiction rule on its LATEST HELLO, and unflagged
+     * the moment a clean HELLO arrives. EvaluateContradictionRules() refreshes
+     * this set on every HELLO (insert on violation, erase on clean), mirroring
+     * the professor's `NeighborTuple::risky` field which is recomputed from
+     * scratch on each PopulateTwoHopNeighborSet() call.
      */
-    std::map<Ipv4Address, uint32_t> m_violationCounter;
+    std::set<Ipv4Address> m_riskyNodes;
 
     // ======================================================================
     // HARNESS INTEGRATION state
@@ -237,15 +231,6 @@ private:
      * and a defense-OFF window is indistinguishable from a clean baseline.
      */
     bool m_enabled;
-
-    /**
-     * \brief Warmup anchor: Simulator::Now() at the last OFF->ON transition.
-     *
-     * EvaluateContradictionRules() stays silent for WARMUP_SECONDS after
-     * this instant (re-anchored semantics of the original absolute-time
-     * warmup; see the comment at the warmup check).
-     */
-    Time m_enableTime;
 
     /**
      * \brief Fictitious-node switch ("UseFictitiousNodes" attribute). Default true.
