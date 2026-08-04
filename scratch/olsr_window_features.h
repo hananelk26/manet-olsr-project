@@ -503,87 +503,67 @@ public:
   }
 
   // -------------------------- Snapshot -------------------------------------
-  // SCHEMA v5 (NORM-001): all scale-dependent features are normalized using
-  // PASSIVELY-OBSERVABLE denominators only, so the vectors generalize across
-  // node counts, topology extents, window lengths and traffic configurations
-  // WITHOUT leaking any simulation config constant into the features:
-  //   nObs      = distinct addresses observed in the window (TC senders U
-  //               advertised addresses U data senders)  [~ N, observable]
-  //   graphN    = nodes in the advertised-TC graph
-  //   diameter  = observed advertised-graph diameter (hops)
-  //   dur       = window duration (the observer defines its own window)
-  //   flowCount = distinct observed (src,dst) data flows
-  //   hopMean   = mean observed hop count (for per-hop delay)
-  //   sent/delivered bytes = on-air observed offered load
-  // Column names were CHANGED for every column whose semantics changed, so
-  // v4 and v5 CSVs can never be silently mixed (the harness header check
-  // fails loudly). Scale-free columns (ratios, Gini, Hurst, skew/kurtosis,
-  // clustering, density, Vtime, TC inter-arrival) keep their v4 names.
   static std::string CoreFeatureCsvHeader ()
   {
     return
       // A. Control traffic volume (11)
-      "TcPacketRatePerNode,MidPacketRatePerNode,HnaPacketRatePerNode,"
-      "TcBytesPerSecondPerNode,MidBytesPerSecondPerNode,HnaBytesPerSecondPerNode,"
-      "DataPacketRatePerFlow,DataBytesPerSecondPerFlow,"
-      "PerNodeTcRateCv,PerNodeTcBytesCv,PerNodeTcBytesGini,"
+      "TcPacketRate,MidPacketRate,HnaPacketRate,"
+      "TcBytesPerSecond,MidBytesPerSecond,HnaBytesPerSecond,"
+      "DataPacketRate,DataBytesPerSecond,"
+      "PerNodeTcRateStd,PerNodeTcBytesStd,PerNodeTcBytesGini,"
       // B. TC structure (14)
-      "TcMessageSizeMeanPerNode,TcMessageSizeCv,TcMessageSizeP95ToMeanRatio,TcMessageSizeMaxToMeanRatio,"
-      "AdvertisedLinksPerTcMeanNorm,AdvertisedLinksPerTcCv,"
-      "AdvertisedLinksPerTcP95ToMeanRatio,AdvertisedLinksPerTcMaxToMeanRatio,"
-      "TcAnsnIncrementMean,TcAnsnSkipRatePerTc,"
-      "FracNodesOriginatingTc,"
-      "TcMessageContentEntropyNorm,TcVtimeMean,TcVtimeStd,"
+      "TcMessageSizeMean,TcMessageSizeStd,TcMessageSizeP95,TcMessageSizeMax,"
+      "AdvertisedLinksPerTcMean,AdvertisedLinksPerTcStd,"
+      "AdvertisedLinksPerTcP95,AdvertisedLinksPerTcMax,"
+      "TcAnsnIncrementMean,TcAnsnSkipCount,"
+      "NumDistinctTcSenderNodesPerWindow,"
+      "TcMessageContentEntropy,TcVtimeMean,TcVtimeStd,"
       // C. Address sets (5; C3 removed per DEG-001)
-      "FracAddressesSeenInTcAdvertisements,FracDistinctTcSenderAddresses,"
-      "PhantomAddressFraction,AsymmetricAdvertisementFraction,EphemeralAddressFraction,"
+      "NumDistinctAddressesInTcAdvertisements,NumDistinctTcSenderAddresses,"
+      "NumPhantomAddresses,NumAsymmetricAdvertisements,NumEphemeralAddresses,"
       // D. MPR (4)
-      "MprSelectorCountPerTcMeanNorm,MprSelectorCountPerTcCv,"
-      "MprChurnEventsPerSenderPerSecond,DistinctMprSetsPerSender,"
+      "MprSelectorCountPerTcMean,MprSelectorCountPerTcStd,"
+      "NumberOfMprChurnEvents,NumDistinctMprSetsObserved,"
       // E. Paths & forwarding (5; E3, E5, E6 removed)
-      "ObservedHopCountMeanNorm,ObservedHopCountCv,ObservedHopCountMaxNorm,"
-      "PathChangesPerFlowPerSecond,DistinctNextHopsPerSourceNorm,"
+      "ObservedHopCountMean,ObservedHopCountStd,ObservedHopCountMax,"
+      "NumPathChangesPerFlow,NumDistinctNextHopsPerSource,"
       // F. MAC (3; F11, F12, F8 InterFrameSpacingStd removed; OBS-007:
       //    RtsRateLocal, CtsRateLocal, AckRateLocal, AckDelayMean,
       //    AckDelayStd removed)
       "Layer2RetransmissionRate,ChannelBusyTimeFraction,"
-      "InterFrameSpacingMeanTimesNodes,"
+      "InterFrameSpacingMean,"
       // G. Performance (6; G5, G7 JitterStd, G9 removed)
-      "PacketsDeliveredPerFlowPerSecond,PacketsSentPerFlowPerSecond,"
-      "EndToEndLatencyPerHop,EndToEndLatencyCv,"
-      "JitterToLatencyRatio,DeliveredToSentBytesRatio,"
-      // H. Time & periodicity (6) -- protocol-constant / dimensionless: unchanged
+      "PacketsDeliveredCount,PacketsSentCount,"
+      "EndToEndLatencyMean,EndToEndLatencyStd,"
+      "JitterMean,ThroughputBitsPerSecond,"
+      // H. Time & periodicity (6)
       "TcInterArrivalMean,TcInterArrivalStd,TcInterArrivalP95,"
       "TcBurstinessHurst,"
       "ControlMessageInterArrivalSkew,ControlMessageInterArrivalKurtosis,"
       // I. Entropy & stats (5; I3, I6 removed)
-      "TcSenderAddressEntropyNorm,TcAdvertisedAddressEntropyNorm,"
+      "TcSenderAddressEntropy,TcAdvertisedAddressEntropy,"
       "PacketSizeDistributionSkew,PacketSizeDistributionKurtosis,"
-      "TcPayloadByteDistributionEntropyNorm,"
+      "TcPayloadByteDistributionEntropy,"
       // J. Topology graph (22)
-      "AdvertisedAverageDegreeNorm,AdvertisedDegreeCv,AdvertisedDegreeSkew,"
-      "AdvertisedDegreeKurtosis,FracDegreeOneNodes,"
-      "AdvertisedClusteringCoefficient,TrianglesPerNode,"
-      "ConnectedComponentsPerNode,AdvertisedDiameterNorm,AdvertisedRadiusToDiameterRatio,"
+      "AdvertisedAverageDegree,AdvertisedDegreeStd,AdvertisedDegreeSkew,"
+      "AdvertisedDegreeKurtosis,NumberOfDegreeOneNodes,"
+      "AdvertisedClusteringCoefficient,NumberOfTrianglesInAdvertisedGraph,"
+      "AdvertisedConnectivityComponents,AdvertisedDiameter,AdvertisedRadius,"
       "AdvertisedGraphDensity,"
-      "BetweennessCentralityMeanNorm,BetweennessCentralityStdNorm,BetweennessCentralityMaxNorm,"
-      "ClosenessCentralityMeanWF,ClosenessCentralityStdWF,"
-      "EdgePersistenceFraction,EdgeEmergenceFraction,EdgeChurnFraction,"
-      "HexagonalCyclesPerNode,ShortCyclesPerNode,AdvertisedSpectralRadiusNorm,"
-      // K. Defense-detection breadth (FEAT-008) (14)
-      "TcOriginationRateMin,TcOriginationRateMean,TcOriginationRateStd,TcOriginationRateMax,"
-      "TcRelayerBreadthFracMin,TcRelayerBreadthFracMean,TcRelayerBreadthFracStd,TcRelayerBreadthFracMax,"
-      "TcMaxHopReachNormMin,TcMaxHopReachNormMean,TcMaxHopReachNormStd,TcMaxHopReachNormMax,"
-      "FracForwardersChangingNextHop,DistinctForwarderNextHopPairsPerNode";
+      "BetweennessCentralityMean,BetweennessCentralityStd,BetweennessCentralityMax,"
+      "ClosenessCentralityMean,ClosenessCentralityStd,"
+      "EdgePersistenceMean,EdgeEmergenceWithinWindowRate,EdgeChurnWithinWindowRate,"
+      "NumberOfHexagonalCycles,NumberOfShortCycles,AdvertisedSpectralRadius,"
+      // K. Defense-detection breadth (FEAT-008, schema v4) (14)
+      "TcOriginationCountMin,TcOriginationCountMean,TcOriginationCountStd,TcOriginationCountMax,"
+      "TcRelayerBreadthMin,TcRelayerBreadthMean,TcRelayerBreadthStd,TcRelayerBreadthMax,"
+      "TcMaxHopReachMin,TcMaxHopReachMean,TcMaxHopReachStd,TcMaxHopReachMax,"
+      "DistinctForwardersChangingNextHop,NumDistinctNextHopsObservedNetworkwide";
   }
 
   // ----- strict_observable_v2 parity group (L): 33 columns. ----------------
   // Names and order match defense_detection_v2.py's METRICS list so the
   // existing v2 ML pipeline can consume these columns directly.
-  // NORM-001 (schema v5): names/order unchanged, but the VALUES of all
-  // scale-dependent columns are now normalized (see the table above the
-  // L-group emission in EmitFeatureCsv). Retrain any model that consumed
-  // pre-v5 rows; never mix pre/post-v5 CSVs in one training set.
   static std::string V2FeatureCsvHeader ()
   {
     return
@@ -771,9 +751,8 @@ public:
     const double e2eStd  = Std  (m_dataLatencies);
     // G5 (P95), G7 (JitterStd), G9 removed per DEG-001/DEG-004.
     const double jMean   = Mean (m_jitterSamples);
-    // OBS-006 raw throughput (delivered bytes * 8 / dur) was replaced in
-    // schema v5 by DeliveredToSentBytesRatio (NORM-001): raw bps tracked
-    // the configured offered load, not behavior.
+    // OBS-006: throughput = delivered bytes on air * 8 / dur.
+    const double throughputBps = (m_dataDeliveredBytes * 8.0) / dur;
 
     // === H. Time & periodicity ============================================
     std::vector<double> allTcGaps;
@@ -970,14 +949,8 @@ public:
         double sumDist = 0; int reach = 0;
         for (uint32_t i = 0; i < N; ++i)
           if (i != s && dist[i] > 0) { sumDist += dist[i]; reach++; }
-        // NORM-001: Wasserman-Faust size-corrected closeness,
-        //   C_WF(s) = (reach/(N-1)) * (reach/sumDist).
-        // The raw reach/sumDist shrinks as topologies grow (distances scale
-        // with the graph extent); the WF form is comparable across sizes and
-        // penalizes disconnection, both from observable quantities only.
-        if (sumDist > 0 && N > 1)
-          closenessV[s] = (static_cast<double> (reach) / (N - 1.0))
-                          * (static_cast<double> (reach) / sumDist);
+        if (sumDist > 0)
+          closenessV[s] = static_cast<double> (reach) / sumDist;
 
         std::vector<double> delta (N, 0.0);
         while (!stk.empty ())
@@ -1066,224 +1039,60 @@ public:
     const uint64_t numDistinctNextHopsNetworkwide =
         static_cast<uint64_t> (m_distinctForwarderNextHopPairs.size ());
 
-    // ==== NORM-001 (schema v5): observable denominators ==================
-    // Every denominator below is measurable by a passive in-network node:
-    // no simulation config constant (true N, configured load, packet size,
-    // TC_INTERVAL) is used anywhere.
-    auto SafeDiv = [] (double a, double b) -> double
-    { return (b > 0.0) ? (a / b) : 0.0; };
-
-    // Observed node count: every address seen in ANY capacity this window
-    // (TC originators U addresses advertised in TC payloads U data senders).
-    const double nObs = static_cast<double> (
-        std::max<size_t> (1, m_addressesFirstSeen.size ()));
-    // Observed flow count (distinct on-air (src,dst) pairs).
-    const double flowCnt = static_cast<double> (
-        std::max<size_t> (1, m_dataSentByFlow.size ()));
-    // Observed advertised-graph diameter (hops); >=1 so ratios stay defined.
-    const double diamD = (diameter > 0) ? static_cast<double> (diameter) : 1.0;
-    // Observed mean hop count; >=1 for per-hop delay.
-    const double hopMeanD = (hopMean > 0.0) ? hopMean : 1.0;
-    // Advertised-graph node count; >=1.
-    const double graphN = (N > 0) ? static_cast<double> (N) : 1.0;
-    // Max observed degree (for spectral-radius normalization).
-    const double degMax = degrees.empty () ? 1.0
-        : std::max (1.0, *std::max_element (degrees.begin (), degrees.end ()));
-    // Standard betweenness normalizer: (N-1)(N-2)/2 node pairs.
-    const double btwNorm = (N >= 3)
-        ? (graphN - 1.0) * (graphN - 2.0) * 0.5 : 1.0;
-    // Number of senders with MPR history (for churn-per-sender).
-    const double mprSenders = static_cast<double> (
-        std::max<size_t> (1, m_mprSelectorsHistoryBySender.size ()));
-    const double totalEdges = static_cast<double> (
-        std::max<size_t> (1, m_advertisedEdgesAllTime.size ()));
-    const double totalDirectedEdges = static_cast<double> (
-        std::max<size_t> (1, m_observedDirectedEdges.size ()));
-
-    // A: per-node control rates; per-flow data rates; CV instead of Std.
-    const double tcRateN   = tcRate  / nObs;
-    const double midRateN  = midRate / nObs;
-    const double hnaRateN  = hnaRate / nObs;
-    const double tcBpsN    = tcBps   / nObs;
-    const double midBpsN   = midBps  / nObs;
-    const double hnaBpsN   = hnaBps  / nObs;
-    const double dataPRateN = dataPRate / flowCnt;
-    const double dataBpsN   = dataBps   / flowCnt;
-    const double perNodeTcRateCv  = SafeDiv (perNodeTcRateStd,
-                                             Mean (perNodeTcRates));
-    const double perNodeTcBytesCv = SafeDiv (perNodeTcBytesStd,
-                                             Mean (perNodeTcBytes));
-
-    // B: TC size mean per node (size ~ header + 4B/neighbor ~ degree ~ N);
-    //    shape statistics as ratios to the mean (scale-free).
-    const double tcMsgMeanN   = tcMsgMean / nObs;
-    const double tcMsgCv      = SafeDiv (tcMsgStd, tcMsgMean);
-    const double tcMsgP95R    = SafeDiv (tcMsgP95, tcMsgMean);
-    const double tcMsgMaxR    = SafeDiv (tcMsgMax, tcMsgMean);
-    const double advLnkMeanN  = (nObs > 1.0) ? advLnkMean / (nObs - 1.0) : 0.0;
-    const double advLnkCv     = SafeDiv (advLnkStd, advLnkMean);
-    const double advLnkP95R   = SafeDiv (advLnkP95, advLnkMean);
-    const double advLnkMaxR   = SafeDiv (advLnkMax, advLnkMean);
-    const double ansnSkipRate = SafeDiv (static_cast<double> (ansnSkip),
-                                         static_cast<double> (m_tcCount));
-    const double fracTcSenders = static_cast<double> (distSenders) / nObs;
-    // Max content entropy = log2(#TC messages observed).
-    const double tcContentEntN = (m_tcCount >= 2)
-        ? tcContentEntropy / std::log2 (static_cast<double> (m_tcCount)) : 0.0;
-
-    // C: counts -> fractions of their observable ceilings.
-    const double fracAddrInTc   = static_cast<double> (numAddrInTc) / nObs;
-    const double fracTcSendAddr = static_cast<double> (numDistinctTcSend) / nObs;
-    const double phantomFrac    = SafeDiv (static_cast<double> (numPhantom),
-                                           static_cast<double> (numAddrInTc));
-    const double asymFrac       = static_cast<double> (numAsym)
-                                  / totalDirectedEdges;
-    const double ephemeralFrac  = static_cast<double> (numEphemeral) / nObs;
-
-    // D: selector counts vs. (nObs-1); churn per sender per second.
-    const double mprSelMeanN = (nObs > 1.0) ? mprSelMean / (nObs - 1.0) : 0.0;
-    const double mprSelCv    = SafeDiv (mprSelStd, mprSelMean);
-    const double mprChurnN   = static_cast<double> (mprChurn)
-                               / (mprSenders * dur);
-    const double mprSetsN    = static_cast<double> (totalDistinctMprSets)
-                               / mprSenders;
-
-    // E: hop counts vs. observed diameter; path changes per flow per second.
-    const double hopMeanNorm = hopMean / diamD;
-    const double hopCv       = SafeDiv (hopStd, hopMean);
-    const double hopMaxNorm  = hopMax / diamD;
-    const double pathChangesN = pathChangesPerFlow / dur;
-    const double nextHopsN    = SafeDiv (distinctNextHopsPerSrc,
-                                         std::max (1.0, degMean));
-
-    // F: IFS mean is ~1/(total frame rate) which scales with node count
-    //    (under per-node-proportional load); multiplying by nObs removes
-    //    the node-count dependence while keeping load anomalies visible.
-    const double ifsMeanN = ifsMean * nObs;
-
-    // G: counts -> per-flow per-second rates; delay per hop; CV; jitter
-    //    relative to delay; throughput -> delivered/sent byte ratio (both
-    //    observed on-air), i.e. a byte-level delivery ratio in [0,1].
-    const double pktsDelN = static_cast<double> (pktsDelivered)
-                            / (flowCnt * dur);
-    const double pktsSentN = static_cast<double> (pktsSent)
-                             / (flowCnt * dur);
-    const double e2ePerHop = e2eMean / hopMeanD;
-    const double e2eCv     = SafeDiv (e2eStd, e2eMean);
-    const double jitterR   = SafeDiv (jMean, e2eMean);
-    const double deliveredBytesRatio = SafeDiv (
-        static_cast<double> (m_dataDeliveredBytes),
-        static_cast<double> (m_dataBytes));
-
-    // I: entropies -> relative entropies in [0,1] (divide by log2 of the
-    //    number of observed categories); byte entropy vs. log2(min(nObs,256))
-    //    since only the last octet is recorded (DEG-002).
-    const double tcSenderEntN = (hSender.size () >= 2)
-        ? tcSenderEnt / std::log2 (static_cast<double> (hSender.size ())) : 0.0;
-    const double tcAdvEntN = (hAdv.size () >= 2)
-        ? tcAdvEnt / std::log2 (static_cast<double> (hAdv.size ())) : 0.0;
-    const double byteEntCeil = std::log2 (std::min (256.0, std::max (2.0, nObs)));
-    const double byteEntN = byteEnt / byteEntCeil;
-
-    // J: degree stats vs. (graphN-1); counts per node; diameter vs. (N-1);
-    //    radius as radius/diameter ratio; Brandes betweenness by the
-    //    standard (N-1)(N-2)/2; cycles per node; spectral radius vs. max
-    //    degree. (Closeness already size-corrected in-loop, NORM-001 WF.)
-    const double degMeanN  = (graphN > 1.0) ? degMean / (graphN - 1.0) : 0.0;
-    const double degCv     = SafeDiv (degStd, degMean);
-    const double degOneFrac = static_cast<double> (degOne) / graphN;
-    const double trianglesN = static_cast<double> (triangles) / graphN;
-    const double componentsN = static_cast<double> (numComponents) / graphN;
-    const double diameterN = (graphN > 1.0)
-        ? static_cast<double> (diameter) / (graphN - 1.0) : 0.0;
-    const double radiusToDiam = (diameter > 0)
-        ? static_cast<double> (radius) / static_cast<double> (diameter) : 0.0;
-    const double btwMeanN = btwMean / btwNorm;
-    const double btwStdN  = btwStd  / btwNorm;
-    const double btwMaxN  = btwMax  / btwNorm;
-    const double edgePersistFrac = edgePersistMean / dur;
-    // Emergence/churn as fractions of the observed edge population (the
-    // per-second rates scaled with |E|, i.e. with network size).
-    const double edgeEmergenceFrac = (edgeEmergenceRate * dur) / totalEdges;
-    const double edgeChurnFrac     = (edgeChurnRate * dur) / totalEdges;
-    const double hexCyclesN   = static_cast<double> (hexCycles) / graphN;
-    const double shortCyclesN = static_cast<double> (shortCycles) / graphN;
-    const double spectralN    = spectralRadius / degMax;
-
-    // K: origination counts -> per-second rates; relayer breadth -> fraction
-    //    of observed nodes; hop reach vs. observed diameter; forwarder
-    //    counts -> fractions / per-node.
-    const double tcOrigMinN  = tcOrigMin  / dur;
-    const double tcOrigMeanN = tcOrigMean / dur;
-    const double tcOrigStdN  = tcOrigStd  / dur;
-    const double tcOrigMaxN  = tcOrigMax  / dur;
-    const double tcRelMinN   = tcRelMin  / nObs;
-    const double tcRelMeanN  = tcRelMean / nObs;
-    const double tcRelStdN   = tcRelStd  / nObs;
-    const double tcRelMaxN   = tcRelMax  / nObs;
-    const double tcHopMinN   = tcHopMin  / diamD;
-    const double tcHopMeanN  = tcHopMean / diamD;
-    const double tcHopStdN   = tcHopStd  / diamD;
-    const double tcHopMaxN   = tcHopMax  / diamD;
-    const double fwdChangedFrac = static_cast<double> (
-        distinctForwardersChangingNextHop) / nObs;
-    const double nextHopPairsN = static_cast<double> (
-        numDistinctNextHopsNetworkwide) / nObs;
-
-    // ---- Emit row (schema v5, normalized) --------------------------------
+    // ---- Emit row -------------------------------------------------------
     std::ostringstream r;
     r << std::fixed << std::setprecision (6);
     // A (11)
-    r << tcRateN << "," << midRateN << "," << hnaRateN << ","
-      << tcBpsN  << "," << midBpsN  << "," << hnaBpsN  << ","
-      << dataPRateN << "," << dataBpsN << ","
-      << perNodeTcRateCv << "," << perNodeTcBytesCv << "," << perNodeTcBytesGini << ",";
+    r << tcRate << "," << midRate << "," << hnaRate << ","
+      << tcBps  << "," << midBps  << "," << hnaBps  << ","
+      << dataPRate << "," << dataBps << ","
+      << perNodeTcRateStd << "," << perNodeTcBytesStd << "," << perNodeTcBytesGini << ",";
     // B (14)
-    r << tcMsgMeanN << "," << tcMsgCv << "," << tcMsgP95R << "," << tcMsgMaxR << ","
-      << advLnkMeanN << "," << advLnkCv << "," << advLnkP95R << "," << advLnkMaxR << ","
-      << ansnMean << "," << ansnSkipRate << ","
-      << fracTcSenders << ","
-      << tcContentEntN << "," << tcVtMean << "," << tcVtStd << ",";
+    r << tcMsgMean << "," << tcMsgStd << "," << tcMsgP95 << "," << tcMsgMax << ","
+      << advLnkMean << "," << advLnkStd << "," << advLnkP95 << "," << advLnkMax << ","
+      << ansnMean << "," << ansnSkip << ","
+      << distSenders << ","
+      << tcContentEntropy << "," << tcVtMean << "," << tcVtStd << ",";
     // C (5)
-    r << fracAddrInTc << "," << fracTcSendAddr << ","
-      << phantomFrac << "," << asymFrac << "," << ephemeralFrac << ",";
+    r << numAddrInTc << "," << numDistinctTcSend << ","
+      << numPhantom << "," << numAsym << "," << numEphemeral << ",";
     // D (4)
-    r << mprSelMeanN << "," << mprSelCv << ","
-      << mprChurnN << "," << mprSetsN << ",";
+    r << mprSelMean << "," << mprSelStd << ","
+      << mprChurn << "," << totalDistinctMprSets << ",";
     // E (5)
-    r << hopMeanNorm << "," << hopCv << "," << hopMaxNorm << ","
-      << pathChangesN << "," << nextHopsN << ",";
+    r << hopMean << "," << hopStd << "," << hopMax << ","
+      << pathChangesPerFlow << "," << distinctNextHopsPerSrc << ",";
     // F (3)
     r << l2RetxRate << "," << busyFrac << ","
-      << ifsMeanN << ",";
+      << ifsMean << ",";
     // G (6)
-    r << pktsDelN << "," << pktsSentN << ","
-      << e2ePerHop << "," << e2eCv << ","
-      << jitterR << "," << deliveredBytesRatio << ",";
-    // H (6) -- protocol-constant / dimensionless: unchanged
+    r << pktsDelivered << "," << pktsSent << ","
+      << e2eMean << "," << e2eStd << ","
+      << jMean << "," << throughputBps << ",";
+    // H (6)
     r << tcGapMean << "," << tcGapStd << "," << tcGapP95 << ","
       << tcHurst << ","
       << ctrlSkew << "," << ctrlKurt << ",";
     // I (5)
-    r << tcSenderEntN << "," << tcAdvEntN << ","
+    r << tcSenderEnt << "," << tcAdvEnt << ","
       << pktSkew << "," << pktKurt << ","
-      << byteEntN << ",";
+      << byteEnt << ",";
     // J (22)
-    r << degMeanN << "," << degCv << "," << degSkew << "," << degKurt << ","
-      << degOneFrac << ","
-      << clustering << "," << trianglesN << ","
-      << componentsN << "," << diameterN << "," << radiusToDiam << ","
+    r << degMean << "," << degStd << "," << degSkew << "," << degKurt << ","
+      << degOne << ","
+      << clustering << "," << triangles << ","
+      << numComponents << "," << diameter << "," << radius << ","
       << density << ","
-      << btwMeanN << "," << btwStdN << "," << btwMaxN << ","
+      << btwMean << "," << btwStd << "," << btwMax << ","
       << closMean << "," << closStd << ","
-      << edgePersistFrac << "," << edgeEmergenceFrac << "," << edgeChurnFrac << ","
-      << hexCyclesN << "," << shortCyclesN << "," << spectralN;
-    // K (14): FEAT-008 defense-detection breadth (normalized)
-    r << "," << tcOrigMinN  << "," << tcOrigMeanN << "," << tcOrigStdN  << "," << tcOrigMaxN
-      << "," << tcRelMinN   << "," << tcRelMeanN  << "," << tcRelStdN   << "," << tcRelMaxN
-      << "," << tcHopMinN   << "," << tcHopMeanN  << "," << tcHopStdN   << "," << tcHopMaxN
-      << "," << fwdChangedFrac
-      << "," << nextHopPairsN;
+      << edgePersistMean << "," << edgeEmergenceRate << "," << edgeChurnRate << ","
+      << hexCycles << "," << shortCycles << "," << spectralRadius;
+    // K (14): FEAT-008 defense-detection breadth
+    r << "," << tcOrigMin  << "," << tcOrigMean << "," << tcOrigStd  << "," << tcOrigMax
+      << "," << tcRelMin   << "," << tcRelMean  << "," << tcRelStd   << "," << tcRelMax
+      << "," << tcHopMin   << "," << tcHopMean  << "," << tcHopStd   << "," << tcHopMax
+      << "," << distinctForwardersChangingNextHop
+      << "," << numDistinctNextHopsNetworkwide;
 
     // ----- Mode Core: emit groups A-K exactly as before. -----------------
     if (mode == FeatureMode::Core)
@@ -1348,64 +1157,22 @@ public:
         ? static_cast<double> (m_observedDirectedEdges.size ())
           / static_cast<double> (m_addressesSeenInTcPayload.size ()) : 0.0;
 
-    // NORM-001 (schema v5): the L-group COLUMN NAMES are kept identical to
-    // defense_detection_v2.py's METRICS list (parity requirement), but the
-    // VALUES of every scale-dependent metric are now normalized with the
-    // same observable denominators as groups A-K. Any v2 model trained on
-    // pre-v5 CSVs MUST be retrained; do not mix pre/post-v5 rows.
-    //   TcMessageRate/Mid/Hna        -> per observed node
-    //   AverageAdvertisedLinksPerTC  -> / (nObs-1)
-    //   AverageEndToEndDelay         -> per observed hop
-    //   AverageJitter                -> jitter/delay ratio
-    //   Throughput                   -> delivered/sent bytes ratio [0,1]
-    //   AverageHopCount              -> / observed diameter
-    //   DataPacketRate               -> per observed flow
-    //   FlowCount                    -> flows per observed node
-    //   Avg/StdFlowDuration          -> fraction of window
-    //   AvgFlowThroughput            -> vs. mean observed per-flow rate
-    //   Flow*Std                     -> coefficients of variation
-    //   AvgFlowDelay                 -> per observed hop
-    //   AvgFlowJitter                -> vs. mean per-flow delay
-    //   AvgTx{Bytes,Packets}PerFlow  -> per second
-    //   AvgRx{Bytes,Packets}PerFlow  -> Rx/Tx ratios [0,1]
-    //   AvgTxPacketSize              -> vs. mean observed packet size
-    //   AvgRxPacketSize              -> Rx/Tx size ratio
-    //   AverageMprCount              -> / (nObs-1)
-    // Already scale-free & unchanged: NormalizedRoutingLoad, both overhead
-    // ratios, PDR, PLR, RxTxPacketRatio, AvgFlowLossRate, FlowLossRateStd.
-    const double fDurMean  = Mean (fDur),   fDurStd  = Std (fDur);
-    const double fThrMean  = Mean (fThr);
-    const double fDelMean  = Mean (fDelay);
-    const double fJitMean  = Mean (fJit);
-    const double fTxBMean  = Mean (fTxB),   fRxBMean = Mean (fRxB);
-    const double fTxPMean  = Mean (fTxP),   fRxPMean = Mean (fRxP);
-    // Mean observed per-flow offered rate (bits/s), on-air observable.
-    const double aggPerFlowBits = (L_dataBytes * 8.0 / dur) / flowCnt;
-    const double txPktSize = (m_dataPackets > 0) ? L_dataBytes / L_dataPkts : 0.0;
-    const double rxPktSize = (pktsDelivered > 0)
-        ? static_cast<double> (m_dataDeliveredBytes)
-          / static_cast<double> (pktsDelivered) : 0.0;
-    const double allPktSizeMean = Mean (sizesD);
-
     std::ostringstream rl;
     rl << std::fixed << std::setprecision (6);
-    rl << tcRateN << "," << midRateN << "," << hnaRateN << ","
-       << advLnkMeanN << ","
+    rl << tcRate << "," << midRate << "," << hnaRate << ","
+       << advLnkMean << ","
        << L_nrl << "," << L_overheadRatio << "," << L_overheadBytesRatio << ","
-       << L_pdr << "," << (1.0 - L_pdr) << "," << e2ePerHop << "," << jitterR << ","
-       << deliveredBytesRatio << "," << hopMeanNorm << "," << dataPRateN << "," << L_pdr << ","
-       << (static_cast<double> (m_dataSentByFlow.size ()) / nObs) << ","
-       << (fDurMean / dur) << "," << (fDurStd / dur) << ","
-       << SafeDiv (fThrMean, aggPerFlowBits) << ","
-       << (fDelMean / hopMeanD) << "," << SafeDiv (fJitMean, fDelMean) << ","
-       << Mean (fLoss) << ","
-       << SafeDiv (Std (fThr), fThrMean) << "," << SafeDiv (Std (fDelay), fDelMean) << ","
-       << SafeDiv (Std (fJit), fJitMean) << "," << Std (fLoss) << ","
-       << (fTxBMean / dur) << "," << SafeDiv (fRxBMean, fTxBMean) << ","
-       << (fTxPMean / dur) << "," << SafeDiv (fRxPMean, fTxPMean) << ","
-       << SafeDiv (txPktSize, allPktSizeMean) << ","
-       << SafeDiv (rxPktSize, txPktSize) << ","
-       << ((nObs > 1.0) ? L_avgMprCount / (nObs - 1.0) : 0.0);
+       << L_pdr << "," << (1.0 - L_pdr) << "," << e2eMean << "," << jMean << ","
+       << throughputBps << "," << hopMean << "," << dataPRate << "," << L_pdr << ","
+       << static_cast<double> (m_dataSentByFlow.size ()) << ","
+       << Mean (fDur) << "," << Std (fDur) << "," << Mean (fThr) << ","
+       << Mean (fDelay) << "," << Mean (fJit) << "," << Mean (fLoss) << ","
+       << Std (fThr) << "," << Std (fDelay) << "," << Std (fJit) << "," << Std (fLoss) << ","
+       << Mean (fTxB) << "," << Mean (fRxB) << "," << Mean (fTxP) << "," << Mean (fRxP) << ","
+       << ((m_dataPackets > 0) ? L_dataBytes / L_dataPkts : 0.0) << ","
+       << ((pktsDelivered > 0) ? static_cast<double> (m_dataDeliveredBytes)
+                                 / static_cast<double> (pktsDelivered) : 0.0) << ","
+       << L_avgMprCount;
 
     if (mode == FeatureMode::V2Only)
       return rl.str ();
