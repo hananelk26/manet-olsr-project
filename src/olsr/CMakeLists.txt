@@ -9,7 +9,6 @@ build_lib(
     model/olsr-defense-strategy.cc
     model/olsr-defense-gcop.cc
     model/olsr-watchdog-defense.cc
-    model/olsr-defense-fpnt.cc
 
   HEADER_FILES
     helper/olsr-helper.h
@@ -21,7 +20,6 @@ build_lib(
     model/olsr-defense-strategy.h
     model/olsr-defense-gcop.h
     model/olsr-watchdog-defense.h
-    model/olsr-defense-fpnt.h 
 
   LIBRARIES_TO_LINK 
     ${libinternet}
