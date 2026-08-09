@@ -173,6 +173,32 @@
  *            Applied identically in all three harness .cc files;
  *            olsr_window_features.h is untouched.
  *
+ * CHANGELOG (single-pair traffic restoration, TRF-005):
+ *   TRF-005: SUPERSEDES TRF-001. NUM_DATA_FLOWS goes back from 3 to 1, so a
+ *            measurement window carries exactly ONE communicating pair --
+ *            the legacy node1 -> node0 flow -- and therefore exactly 18
+ *            application messages, sent at evenly spaced 2.0 s intervals
+ *            (winStart+4 s ... winStart+38 s inside the 40 s window). The
+ *            multi-flow machinery added by TRF-001..TRF-004 is kept intact
+ *            and simply DEGENERATES to that single flow: SelectDataFlowPairs
+ *            returns flow 0 only, exactly one UdpServer and one UdpClient
+ *            are installed, and the t=60 AssertMinHops gate arbitrates that
+ *            ONE pair -- rejecting the run ("too_close") unless the OLSR
+ *            distance from the sender to the receiver is at least --minHops
+ *            (default 3) hops, so in every ACCEPTED run the sender and the
+ *            receiver are at least 3 hops apart. Knock-on effects:
+ *            UDP_EXPECTED_PER_WINDOW = 18 (was 54), so the oracle's
+ *            udp_expected_in_window and udp_loss_percent are computed
+ *            against 18; attacker_on_path and path_hops_internal describe
+ *            that one path. Topology, node placement, the timeline, every
+ *            CLI flag and the shared collector (olsr_window_features.h) are
+ *            UNCHANGED, and all four CSV schemas are UNCHANGED
+ *            (HEADER_VERSION stays 4); HARNESS_VERSION is bumped
+ *            2.3.0 -> 2.4.0 so single-pair rows are distinguishable from
+ *            multi-flow rows via the existing harness_version column.
+ *            Applied identically to all four harnesses
+ *            (trust / watchdog / dcfm / fpnt).
+ *
  * Output files (replaces single metrics.csv):
  *   --runsFile          one row per accepted run (config/metadata)
  *   --featuresFile      one row per (run_id, scenario) -- ML X-matrix only
@@ -233,7 +259,7 @@ NS_LOG_COMPONENT_DEFINE ("OlsrDcfmEvalMitigation");
 // ============================================================================
 // Version markers (RUN-006 / reproducibility)
 // ============================================================================
-#define HARNESS_VERSION "2.3.0"
+#define HARNESS_VERSION "2.4.0"
 #define HEADER_VERSION  4
 
 // ============================================================================
@@ -275,20 +301,36 @@ static constexpr double UDP_PACKET_INTERVAL        = 2.0;
 static constexpr uint32_t UDP_PACKET_SIZE          = 512;
 static constexpr uint16_t UDP_PORT                 = 80;
 
-// TRF-001: number of SIMULTANEOUS UDP flows per measurement window. Flow 0 is
-// ALWAYS the legacy node1 -> node0 pair; the remaining pairs are selected per
-// run by SelectDataFlowPairs(). Tunable; every flow reuses the per-flow
-// constants above unchanged (same in-window start offset, packet budget,
-// interval and size), so the aggregate offered load scales linearly:
-// NUM_DATA_FLOWS x 18 x 512 B per 40 s window (~6 kb/s of application
-// traffic) -- far below channel saturation.
-static constexpr uint32_t NUM_DATA_FLOWS = 3;
+// TRF-005 (SUPERSEDES TRF-001): number of UDP data flows per measurement
+// window. Set to 1 -- exactly ONE communicating pair per run, the legacy
+// node1 -> node0 pair (UDP_CLIENT_NODE_ID -> UDP_SERVER_NODE_ID). The
+// multi-flow machinery below (SelectDataFlowPairs, the per-flow server and
+// client install loops, the per-flow acceptance gate and the per-flow oracle
+// path walk) is retained and simply DEGENERATES to that single pair, so no
+// code path changes shape.
+//
+// Consequences of the single pair -- each of them a requirement of the
+// evaluation protocol:
+//   * exactly UDP_PACKETS_PER_WINDOW = 18 application messages are sent per
+//     measurement window, at evenly spaced UDP_PACKET_INTERVAL = 2.0 s
+//     intervals (t = winStart+4 s ... winStart+38 s inside the 40 s window);
+//   * UDP_EXPECTED_PER_WINDOW = 1 x 18 = 18, so the oracle's
+//     udp_expected_in_window column and the udp_loss_percent denominator are
+//     computed against 18;
+//   * the t=60 AssertMinHops() gate arbitrates that ONE pair and rejects the
+//     run ("too_close") unless the OLSR distance node1 -> node0 is at least
+//     --minHops (default 3) hops, i.e. in every ACCEPTED run the sender and
+//     the receiver are at least 3 hops apart;
+//   * the offered application load is 18 x 512 B per 40 s window
+//     (~1.8 kb/s) -- far below channel saturation.
+static constexpr uint32_t NUM_DATA_FLOWS = 1;
 static_assert (NUM_DATA_FLOWS >= 1,
                "NUM_DATA_FLOWS must include at least the legacy flow 0");
 
-// TRF-004: total expected UDP receptions per window across ALL flows (the
-// oracle's udp_expected_in_window column and the udp_loss_percent
-// denominator).
+// TRF-004 (as amended by TRF-005): total expected UDP receptions per window
+// across all flows. With the single pair (NUM_DATA_FLOWS = 1) this is exactly
+// 18 -- the oracle's udp_expected_in_window column and the udp_loss_percent
+// denominator.
 static constexpr uint32_t UDP_EXPECTED_PER_WINDOW =
     NUM_DATA_FLOWS * UDP_PACKETS_PER_WINDOW;
 
