@@ -12,7 +12,10 @@ a [GitLab.com issue tracker](https://gitlab.com/nsnam/ns-3-dev/-/issues) number,
 and references prefixed by '!' refer to a
 [GitLab.com merge request](https://gitlab.com/nsnam/ns-3-dev/-/merge_requests) number.
 
-## Release 3-dev
+## Release 3.47
+
+This release is available from:
+<https://www.nsnam.org/release/ns-3.47.tar.bz2>
 
 ### Supported platforms
 
@@ -20,26 +23,58 @@ This release is intended to work on systems with the following minimal
 requirements (Note: not all ns-3 features are available on all systems):
 
 - g++-11.1 or later, or LLVM/clang++-17 or later
-- Python 3.8 or later
+- Python 3.10 or later
 - CMake 3.20 or later
 - (macOS only) Xcode 16.2 or later
 - (Windows only) Msys2/MinGW64, Msys2/UCRT64 and ClangCL/MSVC toolchains, or WSL2
 
+This release of ns-3 updated the minimum supported version of Python from 3.8 to 3.10.
+
+Contributors or maintainers who require the use of cmake-format (CMake formatting utility) to pass
+the ns-3 CI checks should note that only Python 3.12 is currently supported for cmake-format.
+Outside of this utility, Python 3.10 through 3.14 should work with this release.
+
 The version of clang-format enforced by the check-style-clang-format.py script for
 this release is version 20 only.
 
-Version 20 of the clang-tidy linter is now supported and recommended, although versions 15-19
-are still compatible.
+Version 21 of the clang-tidy linter is now supported and recommended, although
+versions 17 to 20 are still compatible.
 
 Python API requires [Cppyy](https://cppyy.readthedocs.io/en/latest/installation.html) and has only
 been tested on Linux. As of this release, the latest known version to work with ns-3 is cppyy==3.5.0.
 
 ### New user-visible features
 
+Numbers preceded by '!' reference GitLab.com Merge Request numbers (for more information)
+Numbers preceded by '#' reference GitLab.com Issue numbers (for more information)
+
+- (applications) !2611 New IEEE 802.11ax evaluation methodology traffic generators for video, VoIP, virtual desktop, and real-time mobile gaming
+- (core) !2633 Added `SystemPath::FindSelf()` to retrieve the full path to the running executable.
+- (examples) !2686 New TCP BBR Python example program.
+- (internet) !2405 Added support for TCP FACK (Forward Acknowledgement).
+- (internet) !2530 Added IPv6 support to Global Routing.
+- (internet) !2434 Added `PrintRouting` functionality to `GlobalRouting` similar to `TraceRoute`.
+- (lr-wpan) !2592 Added PHY preamble and RSSI support.
+- (propagation) !2626 Added 3GPP outdoor-to-indoor (O2I) penetration losses for sub-6 GHz frequencies according to TS 38.901 Table 7.4.3-3, including vehicular O2I losses.
+- (spectrum) !2490 The ns-3 3GPP channel model now supports a spatial-consistency update technique
+  aligned with TR 38.901 Procedure A (Sec. 7.6.3.2).
+- (visualizer) !2663 Add Lr-Wpan NetDevices support to the Pyviz visualizer.
+
 ### Bugs fixed
 
-- (wifi) Fix incorrect aPSDUMaxLength value for 802.11be.
-- (wifi) Fix hardcoded threshold value in EHT PHY to determine per-20MHz CCA indication.
+- (core) #1252 - Handle >1023 character paths to self on Linux
+- (internet) !2624 - Fix TCP LEDBAT congestion window growth calculation
+- (network) #1226 - Fix Ipv6Prefix and Ipv4Mask default constructors
+- (network) !2728 Fix deserialization, TLV field alignment, and MCS padding issues in Radiotap header
+- (propagation) !2593 Fix 3GPP O2I loss distributions that used standard deviation instead of variance from TS 38.901 Table 7.4.3-2
+- (spectrum) #1314 - Fix missing complex conjugation of RX beamforming vector in 3GPP long-term channel component calculation.
+- (wifi) !2613 Fix incorrect aPSDUMaxLength value for 802.11be.
+- (wifi) !2614 Fix hardcoded threshold value in EHT PHY to determine per-20MHz CCA indication.
+- (wifi) !2614 Fix spurious CCA-BUSY notification after channel width has changed
+- (wifi) #1295 - Avoid floating point precision issues in wifi-error-rate-models-test.cc
+- (wifi) #1284 - Fix radiotap for received packets
+- (wifi) !2599 Fix misuse of TX power and power level in remote station manager
+- (visualizer) !2636 - Fix overlapping labels and simulation stop time in PyViz visualizer.
 
 ## Release 3.46.1
 

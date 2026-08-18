@@ -206,6 +206,7 @@ def parse_args(argv):
         ),
         ("build-version", "embedding git changes as a build version during build"),
         ("clang-tidy", "clang-tidy static analysis"),
+        ("clang-tidy-fix", "clang-tidy static analysis and apply automatic fixes"),
         ("dpdk", "the fd-net-device DPDK features"),
         ("eigen", "Eigen3 library support"),
         ("examples", "the ns-3 examples"),
@@ -1443,7 +1444,8 @@ def check_module_installed(module_name: str):
 
 def run_step(args, target_to_run, target_args):
     libdir = "%s/lib" % out_dir
-
+    if not os.path.exists(libdir):
+        libdir += "64"
     custom_env = {
         "PATH": libdir,
         "PYTHONPATH": "%s/bindings/python" % out_dir,
@@ -1531,10 +1533,13 @@ def run_step(args, target_to_run, target_args):
 
         # running with command template?
         if args.command_template:
-            commands = (args.command_template % target_to_run).split()
-            check_program_installed(commands[0])
+            commands = args.command_template % f'"{target_to_run}"'
+            commands = list(re.findall(r'(?:".*?"|\S)+', commands))
+            commands = list(map(lambda x: x.replace('"', ""), commands))
             target_to_run = commands[0]
-            target_args = commands[1:] + target_args
+            commands = commands[1:]
+            check_program_installed(target_to_run)
+            target_args = commands + target_args
 
             # running mpi on the CI?
             if target_to_run in ["mpiexec", "mpirun"] and os.getenv("MPI_CI"):
@@ -1988,6 +1993,19 @@ def main():
                 target_to_run = target_to_run[1:-1]
             target_to_run = target_to_run.split()
             target_to_run, target_args = target_to_run[0], target_to_run[1:]
+            # Remove version prefixes and build profile suffices if they exist
+            if os.path.basename(target_to_run).startswith("ns3"):
+                pardir = os.path.dirname(target_to_run)
+                components = os.path.basename(target_to_run).split("-")
+                if "ns3" in components[0]:
+                    components.pop(0)
+                if "dev" == components[0]:
+                    components.pop(0)
+                if "rc" in components[0]:
+                    components.pop(0)
+                if components[-1] in ["debug", "relwithdebinfo", "default", "optimized"]:
+                    components.pop(-1)
+                target_to_run = f"{pardir}/{'-'.join(components)}"
         else:
             raise Exception("You need to specify a program to run")
 
@@ -2071,15 +2089,12 @@ def main():
             # We let python scripts pass to be able to run ./utils/python-unit-tests.py
             pass
         elif "clang-tidy" in target_to_run:
-            clang_tidy_versions = [
-                "run-clang-tidy",
-                *[f"run-clang-tidy-{x}" for x in range(15, 21)],
-            ]
+            clang_tidy_versions = ["run-clang-tidy"]
             clang_tidy_versions = list(map(lambda x: shutil.which(x), clang_tidy_versions))
             clang_tidy_versions = list(filter(lambda x: x, clang_tidy_versions))
             if not clang_tidy_versions:
                 raise Exception(
-                    "Clang-tidy not found; please install version 15.0.0 or greater, or modify the PATH environment variable"
+                    "Clang-tidy not found; please install it, or modify the PATH environment variable"
                 )
             target_to_run = clang_tidy_versions[-1]
             target_args = [

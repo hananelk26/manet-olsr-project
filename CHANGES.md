@@ -12,31 +12,58 @@ Note that users who upgrade the simulator across versions, or who work directly 
 
 This file is a best-effort approach to solving this issue; we will do our best but can guarantee that there will be things that fall through the cracks, unfortunately. If you, as a user, can suggest improvements to this file based on your experience, please contribute a patch or drop us a note on ns-developers mailing list.
 
-## Changes from ns-3.46.1 to ns-3-dev
+## Changes from ns-3.46.1 to ns-3.47
 
 ### New API
 
+* (applications) New IEEE 802.11ax evaluation methodology traffic generator applications have been added: `TgaxVideoTraffic` (video streaming), `TgaxVoipTraffic` (VoIP), `TgaxVdiTraffic` (virtual desktop infrastructure), and `RtMobileGamingTraffic` (real-time mobile gaming).
 * (applications) New trace sources `SourceApplication::ConnectionSucceeded` and `SourceApplication::ConnectionFailed` have been added to report connection success/failure events.
+* (core) Added `SystemPath::FindSelf()` to retrieve the full path to the running executable.
+* (core) Added `NormalRandomVariable::GetStdDev()` and `NormalRandomVariable::SetStdDev()` convenience functions.
+* (internet) Added support for TCP FACK (Forward Acknowledgement).
+* (internet) Added IPv6 support to Global Routing.
+* (internet) Added `PrintRoute` functionality to `GlobalRouting` similar to `TraceRoute`.
+* (internet) Added attribute `TcpLedbat::AllowedIncrease` to control the ALLOWED_INCREASE parameter defined in RFC 6817.
+* (internet) A new static function `Ipv[4,6]Address::CheckCompatible()` has been added to safely check if a string can be parsed as an IPv4 or IPv6 address.
+* (lr-wpan) The `McpsDataIndication` parameters now include rssi value.
+* (network) Added `std::hash` specialization for `Ipv4Address` and `Ipv6Address`, enabling their use in unordered containers.
+* (propagation) Added 3GPP outdoor-to-indoor (O2I) penetration losses for sub-6 GHz frequencies according to TS 38.901 Table 7.4.3-3, including vehicular O2I penetration losses.
+* (visualizer) Add support to `LrWpanNetDevice` in the PyViz visualizer.
 
 ### Changes to existing API
 
-* Address type 0 was previously used as a wildcard. Type 0 is now disallowd for any practical use. In order to create an Address from raw bytes, you must now set the Address type beforehand. An example is in ArpHeader::Deserialize.
-* (applications) The trace source `UdpServer::Rx` has a changed trace signature as a result of the
-  move of this trace to the `SinkApplication` class.  Client code using this trace can either update
-  to the new `Rx` trace signature or instead use the same trace sink function or method with the
-  the `SinkApplication::RxWithoutAddress` trace.
-* Initializing a Ipv[4,6]Address from a string using the constructor or the `Set` function will result in a crash if the string can not be parsed as an IPv4 or IPv6 address.
-* The `Ipv[4,6]Address::IsInitialized()` function has been deprecated and returns always `true`. The default value of Ipv4Address created with the constructor that takes no arguments is 0.0.0.0 (previously, it was 102.102.102.102), and an Ipv4Address instance can be checked against that unspecified address value (or use std::optional to denote an address that has not been set yet).
-* A new static function `Ipv[4,6]Address::CheckCompatible()` has been added to safely check if a string can be parsed as an IPv4 or IPv6 address.
-* (network): The address class comparison is now based on std::strong_ordering operator<=> comparison operator.
-* (network): An empty (uninitialized) Address is now printed as "00-00:00".
-* (internet): The function `Ipv4InterfaceAddress::SetBroadcast` has been removed from the codebase because the broadcast address must be built from the IP address and mask.
+* (applications) Common logic for starting/stopping, socket management, protocol TypeId, and TX/RX trace sources has been refactored into the `SourceApplication` and `SinkApplication` base classes.
+* (applications) The trace source `UdpServer::Rx` has a changed trace signature as a result of the move of this trace to the `SinkApplication` class.  Client code using this trace can either update to the new `Rx` trace signature or instead use the same trace sink function or method with the `SinkApplication::RxWithoutAddress` trace.
+* (core) The `nstime.h` header no longer includes `event-id.h`. It is possible that code might fail to compile due to this change. Adding an include to `event-id.h` fixes the issue.
+* (internet) Initializing a Ipv[4,6]Address from a string using the constructor or the `Set` function will result in a crash if the string can not be parsed as an IPv4 or IPv6 address.
+* (internet) The `Ipv[4,6]Address::IsInitialized()` function has been deprecated and returns always `true`. The default value of Ipv4Address created with the constructor that takes no arguments is 0.0.0.0 (previously, it was 102.102.102.102), and an Ipv4Address instance can be checked against that unspecified address value (or use std::optional to denote an address that has not been set yet).
+* (internet) The function `Ipv4InterfaceAddress::SetBroadcast` has been removed from the codebase because the broadcast address must be built from the IP address and mask.
+* (internet-apps) The DHCPv6 model has been refactored, and now supports all the DUID types.
+* (lr-wpan) Renamed `lr-wpan-pd-plme-sap-test` to `lr-wpan-phy-test` to improve clarity. Also this testsuite now includes an additional test called `LrWpanPhyCollisionTestCase`.
+* (lr-wpan) The PHY now includes the processing of the preamble as well as registering the RSSI at the moment of receiving the packet.
+* (network) Address type 0 was previously used as a wildcard. Type 0 is now disallowd for any practical use. In order to create an Address from raw bytes, you must now set the Address type beforehand. An example is in ArpHeader::Deserialize.
+* (network) The address class comparison is now based on std::strong_ordering operator<=> comparison operator.
+* (network) An empty (uninitialized) Address is now printed as "00-00:00".
+* (visualizer) The namespace `visualizer` is now used for PyViz related classes.
+* (visualizer) `PyViz` has been reformatted and modernized to current ns-3 standards.
 
 ### Changes to build system
+
+* A new `NS3_CLANG_TIDY_FIX`/`--enable-clang-tidy-fix` option was added to use clang-tidy
+static analysis and automatically apply fixes during build. Not every clang-tidy warning/error
+has automatic fixes, and checks are performed only at build time. Thus requiring rebuilding
+things to re-run checks. As an alternative, one can use `./ns3 run clang-tidy`. And to apply
+fixes, use `./ns3 run "clang-tidy -fix"`.
 
 ### Changed behavior
 
 * (wifi) `CcaEdThreshold` can be changed at run-time.
+* (internet) Updated `TcpLedbat::CongestionAvoidance()` to compute `max_cwnd` as `flightsize + AllowedIncrease * MSS` by adding `m_allowedIncrease * tcb->m_segmentSize`, in accordance with RFC 6817.
+* (internet) The default value of Ipv4Address created with the constructor that takes no arguments is 0.0.0.0 (previously, it was 102.102.102.102).
+* (spectrum) The `UpdatePeriod` attribute of `ThreeGppChannelModel` previously enabled periodic i.i.d. updates of the channel model, but is now used to control spatially-consistent updates of the channel.
+* (propagation) Fixed 3GPP low and high O2I loss distributions where `NormalRandomVariable` variance was incorrectly set with standard deviation values from TS 38.901 Table 7.4.3-2, resulting in lower than expected losses.
+* (wifi) Fixed spurious CCA-BUSY notification after channel width has changed.
+* (wifi) Fixed misuse of TX power and power level in `WifiRemoteStationManager`.
 
 ## Changes from ns-3.46 to ns-3.46.1
 

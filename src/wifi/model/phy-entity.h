@@ -13,6 +13,7 @@
 #define PHY_ENTITY_H
 
 #include "wifi-phy-band.h"
+#include "wifi-phy-common.h"
 #include "wifi-phy-state-helper.h"
 #include "wifi-phy.h"
 #include "wifi-ppdu.h"
@@ -35,17 +36,11 @@
  * @ingroup wifi
  * Declaration of:
  * - ns3::PhyEntity class
- * - ns3::SignalNoiseDbm, ns3::MpduInfo, and ns3::RxSignalInfo structs
  * - ns3::RxPowerWattPerChannelBand typedef
  */
 
 namespace ns3
 {
-
-/**
- * A map of the received power for each band
- */
-using RxPowerWattPerChannelBand = std::map<WifiSpectrumBandInfo, Watt_u>;
 
 class WifiMpdu;
 class WifiPhy;

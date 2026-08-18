@@ -19,6 +19,10 @@ SOURCES = \
 	$(SRC)/antenna/doc/antenna.rst \
 	$(SRC)/aodv/doc/aodv.rst \
 	$(SRC)/applications/doc/applications.rst \
+        $(SRC)/applications/doc/rta-tig-mobile-gaming-traffic.inc \
+        $(SRC)/applications/doc/tgax-video-traffic.inc \
+        $(SRC)/applications/doc/tgax-virtual-desktop-traffic.inc \
+        $(SRC)/applications/doc/tgax-voip-traffic.inc \
 	$(SRC)/bridge/doc/bridge.rst \
 	$(SRC)/brite/doc/brite.rst \
 	$(SRC)/buildings/doc/source/buildings.rst \
@@ -60,6 +64,7 @@ SOURCES = \
 	$(SRC)/internet/doc/ipv4.rst \
 	$(SRC)/internet/doc/ipv6.rst \
 	$(SRC)/internet/doc/routing-overview.rst \
+	$(SRC)/internet/doc/global-routing.rst \
 	$(SRC)/internet/doc/tcp.rst \
 	$(SRC)/internet/doc/udp.rst \
 	$(SRC)/internet-apps/doc/internet-apps.rst \
@@ -125,6 +130,10 @@ SOURCEFIGS = \
 	$(SRC)/internet/doc/routing-specialization.dia \
 	$(SRC)/internet/doc/global-routing-limitation.dia \
 	$(SRC)/internet/doc/figures/tcp-state-machine.png \
+	$(SRC)/internet/doc/figures/fack-cwnd.png \
+	$(SRC)/internet/doc/figures/fack-inflight.png \
+	$(SRC)/internet/doc/figures/fack-packetDrops.png \
+	$(SRC)/internet/doc/figures/fack-throughput.png\
 	$(SRC)/internet/doc/figures/dctcp-10ms-50mbps-tcp-throughput.pdf \
 	$(SRC)/internet/doc/figures/dctcp-10ms-50mbps-tcp-throughput.png \
 	$(SRC)/internet/doc/figures/dctcp-80ms-50mbps-tcp-throughput.pdf \

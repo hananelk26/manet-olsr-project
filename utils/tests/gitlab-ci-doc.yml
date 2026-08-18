@@ -7,7 +7,7 @@
     - pacman-key --init
     - pacman -Syu --noconfirm
       python python-sphinx make libxml2-legacy
-      graphviz imagemagick
+      graphviz imagemagick libx264
       texlive-basic texlive-bin texlive-binextra texlive-latexextra texlive-fontutils texlive-fontsrecommended texlive-mathscience
     # dia is archived
     - pacman --noconfirm -U
@@ -28,7 +28,7 @@ doxygen-1.15:
     # Install Doxygen and dependencies to build ns-3
     - pacman -Syu --noconfirm
       base-devel ninja cmake python ccache gsl gtk3 boost openmpi openssh inetutils git
-    - pacman --noconfirm -U https://archive.archlinux.org/packages/d/doxygen/doxygen-1.15.0-1-x86_64.pkg.tar.zst
+    - pacman --noconfirm -U https://archive.archlinux.org/packages/d/doxygen/doxygen-1.15.0-2-x86_64.pkg.tar.zst
 
     # Build ns-3.
     # Debug build is the fastest, and we do not need to actually execute anything, just the examples for introspection.

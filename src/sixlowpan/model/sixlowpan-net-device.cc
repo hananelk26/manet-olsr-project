@@ -1067,7 +1067,7 @@ SixLowPanNetDevice::CompressLowPanIphc(Ptr<Packet> packet, const Address& src, c
         iphcHeader.SetSac(false);
         iphcHeader.SetDac(false);
 
-        Ipv6Address checker = Ipv6Address("fe80:0000:0000:0000:0000:00ff:fe00:1");
+        auto checker = Ipv6Address("fe80:0000:0000:0000:0000:00ff:fe00:1");
         uint8_t unicastAddrCheckerBuf[16];
         checker.GetBytes(unicastAddrCheckerBuf);
         uint8_t addressBuf[16];
@@ -1292,7 +1292,7 @@ SixLowPanNetDevice::CompressLowPanIphc(Ptr<Packet> packet, const Address& src, c
                     // Stateless compression
 
                     uint8_t multicastAddrCheckerBuf[16];
-                    Ipv6Address multicastCheckAddress = Ipv6Address("ff02::1");
+                    auto multicastCheckAddress = Ipv6Address("ff02::1");
                     multicastCheckAddress.GetBytes(multicastAddrCheckerBuf);
 
                     // The address takes the form ff02::00XX.
@@ -2450,7 +2450,7 @@ SixLowPanNetDevice::ProcessFragment(Ptr<Packet>& packet,
                                                    fragNHeader.GetDatagramTag());
     }
 
-    Ptr<Fragments> fragments;
+    std::shared_ptr<Fragments> fragments;
 
     auto it = m_fragments.find(key);
     if (it == m_fragments.end())
@@ -2472,7 +2472,7 @@ SixLowPanNetDevice::ProcessFragment(Ptr<Packet>& packet,
             m_fragments[oldestKey] = nullptr;
             m_fragments.erase(oldestKey);
         }
-        fragments = Create<Fragments>();
+        fragments = std::make_shared<Fragments>();
         fragments->SetPacketSize(packetSize);
         m_fragments.insert(std::make_pair(key, fragments));
         uint32_t ifIndex = GetIfIndex();

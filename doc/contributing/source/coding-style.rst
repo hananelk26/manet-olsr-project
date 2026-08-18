@@ -268,8 +268,8 @@ Clang-format can be installed using your OS's package manager. Please note that 
 should install one of the supported versions of clang-format, which are listed in the
 following section.
 
-Minimum clang-tidy version
-==========================
+Supported versions of clang-tidy
+================================
 
 Since clang-tidy is a linter that analyzes code and outputs errors found during
 the analysis, developers can use different versions of clang-tidy on the workflow.
@@ -281,7 +281,7 @@ whose warnings must not be ignored. Therefore, developers should, at least, scan
 code with the minimum version of clang-tidy. However, more recent versions can be used,
 which will produce better warnings.
 
-The minimum version is clang-tidy-15.
+The supported versions of clang-tidy are listed in the ``RELEASE_NOTES.md`` document.
 
 Integration with IDEs
 =====================
@@ -877,21 +877,52 @@ file (``*.cc``).
   constexpr uint8_t STATUS_PDU{0};
 
 When declaring variables that are easily deducible from context, prefer to declare them
-with ``auto`` instead of repeating the type name. Not only does this improve code readability,
-by making lines shorter, but it also facilitates future code refactoring.
+with ``auto`` instead of repeating the type name. Not only does this improve code readability
+(by reducing redundancy), but it also facilitates future code refactoring.
 
 .. sourcecode:: cpp
 
-  // Avoid repeating the type name when declaring iterators or pointers, and casting variables
-  std::map<uint32_t, std::string>::const_iterator it = myMap.find(key);
+  // Avoid repeating the type name when declaring variables if the type is obvious from the context
   int* ptr = new int[10];
   uint8_t m = static_cast<uint8_t>(97 + (i % 26));
 
   // Prefer to declare them with auto
-  auto it = myMap.find(key);
   auto* ptr = new int[10];
   auto m = static_cast<uint8_t>(97 + (i % 26));
 
+Containers (maps, sets, vectors) and iterators require understanding how C++ type deduction
+works.  Suppose that you want a const iterator when using ``std::map::find()``, matching the
+below declaration:
+
+.. sourcecode:: cpp
+
+  std::map<uint32_t, std::string>::const_iterator it = myMap.find(key);
+
+If ``myMap`` has been declared as a non-const map (which is the typical case in |ns3|), then the
+following will not result in a ``const_iterator`` because ``find()`` returns a non-const iterator
+on a non-const map:
+
+.. sourcecode:: cpp
+
+  auto it = myMap.find(key);
+
+Instead, if you would like auto to deduce a const iterator from ``find()``, you need to make
+``myMap`` into a const lvalue reference, such as:
+
+.. sourcecode:: cpp
+
+  auto it = std::as_const(myMap).find(key);
+
+Note that ``std::map::begin()`` and ``std::map::end()`` have ``cbegin()`` and ``cend()`` variants
+that explicitly return const iterators, but ``std::map::find()`` and some other methods lack
+such variants, requiring use of ``std::as_const()`` as shown above.
+
+.. sourcecode:: cpp
+
+  auto it = myMap.begin();  // declares a non-const iterator
+  auto cit = myMap.cbegin();  // declares a const iterator
+
+If the iterator is a const iterator, prefixing the name ``it`` with ``c`` can improve readability.
 
 Initialization
 ==============
@@ -959,6 +990,45 @@ To summarize Time declaration and initialization, consider the following example
   Time t{Seconds(0.1)};  // OK, will invoke Seconds(double); integer would be faster
   Time t{100000000}; // NOT OK, is interpreted differently when ``Time::SetResolution()`` called
   Time t{0.1}; // NOT OK, will round to zero; see above and also merge request !2007
+
+A constant that cannot be declared as ``constexpr`` (such as an ``ns3::Time`` constant) and needs
+to be used in multiple translation units (TUs) shall be declared as ``inline`` and initialized in a
+header file that is then included in all the TUs in which the constant needs to be used:
+
+.. sourcecode:: cpp
+
+  inline const Time WIFI_TU = MicroSeconds(1024);
+
+Indeed, since C++17, there may be more than one definition of a variable declared as ``inline`` in
+the program as long as each definition appears in a different TU and all definitions are identical.
+See wifi-standard-constants.h for an example of how to group such constants in a header file and
+declare them so that the values may be used in Attribute defaults.
+
+This approach is to be preferred over declaring the constant as ``extern`` in a header file and
+initializing the constant in a separate ``.cc`` file, because in such a case it would be dangerous
+to use the constant in the initialization of a static variable (e.g., the ``tid`` static member in
+the static ``GetTypeId`` method of classes inheriting from the ``Object`` class) due to the issue
+of static initialization order.
+
+A constant that cannot be declared as ``constexpr`` (such as an ``ns3::Time`` constant) and needs
+to be used in a single TU shall be declared and initialized in the ``.cc`` file before it is used:
+
+.. sourcecode:: cpp
+
+  // Example of declaring a Time constant locally
+  // If DEFAULT_BEACON_INTERVAL is declared with the class implementation such as
+  // below, and it is used as an an attribute default value, make sure that it
+  // is declared before the object TypeId is registered, such as below:
+  const Time DEFAULT_BEACON_INTERVAL = MicroSeconds(DEFAULT_BEACON_INTERVAL_USEC);
+
+  NS_OBJECT_ENSURE_REGISTERED(ApWifiMac);
+
+Instead, constants that can be declared as ``constexpr`` (such as all the POD types) shall be
+initialized in an header file by using the ``constexpr`` keyword only:
+
+.. sourcecode:: cpp
+
+  constexpr uint16_t MIN_AID{1};
 
 Comments
 ========
@@ -1182,10 +1252,46 @@ the issue. In the following example, ``x`` can be declared as ``float`` instead 
 Namespaces
 ==========
 
-Code should always be included in a given namespace, namely ``ns3``.
-In order to avoid exposing internal symbols, consider placing the code in an
-anonymous namespace, which can only be accessed by functions in the same file.
+|ns3| uses the ``ns3`` namespace to separate ns-3 model library code from the
+C++ global namespace. The following guidelines apply to the use of
+the ``ns3`` namespace and additional namespaces. Note that these guidelines are
+applied inconsistently within the |ns3| mainline because |ns3| historically had
+limited use of nested namespaces, and a widespread change to use nested namespaces
+in all libraries would hinder backward compatibility of user programs. Therefore,
+the migration to use the below guidelines is gradual, but they should apply to
+newly authored code.
 
+- |ns3| model library code (code within the ``model`` and ``helper`` directories)
+  should be included within the ``ns3`` namespace.
+- We recommend that new ns-3 modules, intended for the mainline, wrap their
+  model code in a nested namespace. The name of the namespace should be the
+  module name in lowercase, without any hyphens. See the ``lr-wpan`` module
+  for an example (the nested namespace in that case is ``lrwpan``). An example
+  of a recently added module following this guideline is the ``zigbee`` module.
+- Tests should use the ``tests`` namespace outside of the ``ns3`` namespace,
+  and can import the ``ns3`` namespace and any nested namespaces with the ``using``
+  directive.
+- Example program code should not be within the ``ns3`` or nested namespaces, but
+  can import those namespaces with the ``using`` directive.
+- In order to avoid exposing internal symbols, consider placing such code in an
+  anonymous namespace, which can only be accessed by functions in the same file.
+
+When using nested namespaces, a question arises as to the use of prefixes on types
+that are declared in the namespace. For instance, consider the ``LrWpanNetDevice``
+class, which is a derived class of ``NetDevice`` and which exists in the
+``ns3::lrwpan`` namespace. When using scope resolution to refer to these types,
+the prefix is repetitive with the namespace; e.g., ``ns3::lrwpan::LrWpanNetDevice``,
+although ``ns3::lrwpan::NetDevice`` would be sufficient to avoid collisions and
+would be shorter. However, use of the shorter version can hinder regular expression
+searches through the codebase for given types, and require more instances of scope
+resolution. This style
+guide leaves this decision of whether to prefix type names with nested namespace
+hints (such as ``LrWpanNetDevice``) or to shorten the type names (such as
+``NetDevice``) for authors to decide, but in the case where a name may be the same
+as used in another module (such as the NetDevice example herein), a prefix on the
+type name is recommended.
+
+The following guidelines apply to the code syntax for namespace usage.
 Code within namespaces should not be indented. To more easily identify the end
 of a namespace, add a trailing comment to its closing brace.
 
@@ -1197,8 +1303,6 @@ of a namespace, add a trailing comment to its closing brace.
   // (...)
 
   } // namespace ns3
-
-Namespace names should follow the snake_case convention.
 
 Unused variables
 ================
