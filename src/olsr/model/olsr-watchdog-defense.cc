@@ -74,9 +74,13 @@ OlsrWatchdogDefense::GetTypeId()
                       MakeUintegerAccessor(&OlsrWatchdogDefense::m_blacklistThreshold),
                       MakeUintegerChecker<uint32_t>())
         .AddAttribute("RtsToDataRatioThreshold",
-                      "RTS:DATA ratio above which a neighbor is considered "
-                      "suspicious (heuristic for attackers hidden by receiver "
-                      "being out of our range).",
+                      "INERT. Formerly the RTS:DATA ratio above which a "
+                      "neighbor was considered suspicious. That heuristic "
+                      "treated RTS activity as incriminating, which inverts "
+                      "the cross-layer test of Baiad et al., where RTS/CTS "
+                      "evidence is exculpatory. Removed from the decision "
+                      "path; the attribute is retained only so that existing "
+                      "harness scripts that set it continue to run.",
                       DoubleValue(3.0),
                       MakeDoubleAccessor(&OlsrWatchdogDefense::m_rtsToDataRatioThresh),
                       MakeDoubleChecker<double>(0.0))
@@ -93,14 +97,33 @@ OlsrWatchdogDefense::GetTypeId()
                       MakeUintegerAccessor(&OlsrWatchdogDefense::m_macFailureThreshold),
                       MakeUintegerChecker<uint32_t>())
         .AddAttribute("MinRtsForHeuristic",
-                      "Minimum RTS count from a neighbor (with no DATA) before "
-                      "applying the 'too many RTS = attacker' heuristic.",
+                      "INERT. Formerly the minimum RTS count before applying "
+                      "the 'too many RTS = attacker' heuristic. See "
+                      "RtsToDataRatioThreshold; retained for harness "
+                      "compatibility only.",
                       UintegerValue(5),
                       MakeUintegerAccessor(&OlsrWatchdogDefense::m_minRtsForHeuristic),
                       MakeUintegerChecker<uint32_t>())
+        .AddAttribute("RtsCtsDiscrepancyThreshold",
+                      "Difference between RTS frames sent by a monitored node "
+                      "and CTS frames it was granted, at or above which the "
+                      "MAC monitor infers channel contention and voids the "
+                      "watchdog report against that node. Baiad et al. state "
+                      "only that a difference indicates collision, giving no "
+                      "numeric threshold; the default of 1 is that literal "
+                      "reading. Raising it to 2 tolerates a single RTS left "
+                      "in flight across a window boundary.",
+                      UintegerValue(1),
+                      MakeUintegerAccessor(&OlsrWatchdogDefense::m_rtsCtsDiscrepancyThresh),
+                      MakeUintegerChecker<uint32_t>(1))
         .AddAttribute("MinSelfReliability",
-                      "Floor value for self-reliability score; prevents it "
-                      "from dropping so low that detection becomes impossible.",
+                      "INERT. Formerly the floor of a continuous "
+                      "self-reliability score that scaled the blacklist "
+                      "threshold. Baiad et al. define the monitor status "
+                      "MAC_s as binary (Alg. 4 Part B): a watchdog with "
+                      "listening problems is eliminated for the round, not "
+                      "merely trusted less. Retained for harness "
+                      "compatibility only.",
                       DoubleValue(0.6),
                       MakeDoubleAccessor(&OlsrWatchdogDefense::m_minSelfReliability),
                       MakeDoubleChecker<double>(0.01, 1.0))
@@ -129,6 +152,17 @@ OlsrWatchdogDefense::GetTypeId()
                       UintegerValue(2),
                       MakeUintegerAccessor(&OlsrWatchdogDefense::m_minDataObservations),
                       MakeUintegerChecker<uint32_t>())
+        .AddAttribute("VerifyOnwardHop",
+                      "Require that a retransmission observed from a "
+                      "monitored node be addressed to a plausible onward hop "
+                      "before it counts as a genuine forward. Closes the hole "
+                      "Marti et al. describe for hop-by-hop protocols, where "
+                      "a node can transmit to a non-existent address and "
+                      "appear to have forwarded. Disable to reproduce the "
+                      "unverified behaviour.",
+                      BooleanValue(true),
+                      MakeBooleanAccessor(&OlsrWatchdogDefense::m_verifyOnwardHop),
+                      MakeBooleanChecker())
         .AddAttribute("Enabled",
                       "Master on/off switch. When false the defense is a no-op: "
                       "IsMalicious() always returns false and PeriodicCheck() "
@@ -148,9 +182,10 @@ OlsrWatchdogDefense::OlsrWatchdogDefense()
     : m_protocol(nullptr),
       m_setupDone(false),
       m_selfDropsWindow(0),
-      m_selfReliabilityScore(1.0),
-      m_warmupUntil(Seconds(0)),
-      m_enabled(true)
+      m_selfDropsPrevWindow(0),
+      m_verifyOnwardHop(true),
+      m_enabled(true),
+      m_warmupUntil(Seconds(0))
 {
     NS_LOG_FUNCTION(this);
 }
@@ -373,7 +408,7 @@ OlsrWatchdogDefense::ResetAccumulatedState()
     m_neighborStats.clear();         // 3. per-neighbor evidence/probation counters
     m_macToIp.clear();               // 4. learned MAC<->IP map (relearned in warmup)
     m_selfDropsWindow = 0;           // 5. local PHY-drop window counter
-    m_selfReliabilityScore = 1.0;    // 6. self-reliability EWMA -> default
+    m_selfDropsPrevWindow = 0;       // 6. local PHY-drop counter, prev round
     m_warmupUntil = Simulator::Now() + m_warmupDuration; // 7. re-arm warmup
 
     // Intentionally PRESERVED (these are not accumulated detection state):
@@ -399,6 +434,7 @@ OlsrWatchdogDefense::GetDebugStateSizes() const
     s.neighborStats    = m_neighborStats.size();
     s.macToIp          = m_macToIp.size();
     s.selfDropsWindow  = m_selfDropsWindow;
+    s.selfDropsPrev    = m_selfDropsPrevWindow;
     // Reports ACTUAL container sizes irrespective of m_enabled, so a read taken
     // immediately after ResetAccumulatedState() shows all zeros even while
     // disabled -- exactly what the harness's leak check expects.
@@ -615,9 +651,85 @@ OlsrWatchdogDefense::TryExtractIpSource(Ptr<const Packet> rawWifiPkt,
     return true;
 }
 
+bool
+OlsrWatchdogDefense::IsKnownNode(Ipv4Address addr) const
+{
+    if (addr == Ipv4Address() || addr == m_mainAddress)
+    {
+        return false;
+    }
+    if (!m_protocol)
+    {
+        return false;
+    }
+
+    for (const auto& n : m_protocol->GetNeighbors())
+    {
+        if (n.neighborMainAddr == addr)
+        {
+            return true;
+        }
+    }
+    for (const auto& n2 : m_protocol->GetTwoHopNeighbors())
+    {
+        if (n2.twoHopNeighborAddr == addr || n2.neighborMainAddr == addr)
+        {
+            return true;
+        }
+    }
+    for (const auto& t : m_protocol->GetTopologySet())
+    {
+        if (t.destAddr == addr || t.lastAddr == addr)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool
+OlsrWatchdogDefense::IsPlausibleOnwardHop(Mac48Address receiver,
+                                          Ipv4Address forwarder) const
+{
+    if (!m_verifyOnwardHop)
+    {
+        return true;
+    }
+
+    // A unicast data relay is never broadcast or multicast. Marti et al. name
+    // exactly this as the way a node fakes a forward under a hop-by-hop
+    // protocol.
+    if (receiver == Mac48Address::GetBroadcast() || receiver.IsGroup())
+    {
+        return false;
+    }
+
+    // Sending it back to us is not forwarding it onward.
+    if (receiver == m_myMacAddress)
+    {
+        return false;
+    }
+
+    Ipv4Address rxIp = LookupIpFromMac(receiver);
+    if (rxIp == Ipv4Address())
+    {
+        // Unresolved. We cannot show the hop is bogus, so we do not treat it
+        // as such: the watchdog never accuses on absence of information.
+        return true;
+    }
+    if (rxIp == m_mainAddress || rxIp == forwarder)
+    {
+        return false;
+    }
+
+    // The target must be a node we have actually heard of. A fabricated
+    // address appears nowhere in the link-state view.
+    return IsKnownNode(rxIp);
+}
+
 void
 OlsrWatchdogDefense::OnNeighborForwardedPacket(Mac48Address transmitter,
-                                                Mac48Address /*receiver*/,
+                                                Mac48Address receiver,
                                                 Ptr<const Packet> packet)
 {
     if (!m_enabled) return;
@@ -646,10 +758,22 @@ OlsrWatchdogDefense::OnNeighborForwardedPacket(Mac48Address transmitter,
     {
         if (pp->packetUid == uid)
         {
+            if (!IsPlausibleOnwardHop(receiver, txIp))
+            {
+                // The frame carries our packet but is addressed nowhere real.
+                // Leave the entry pending so that it ages out and is scored:
+                // an unverifiable relay is not a relay.
+                NS_LOG_DEBUG(m_mainAddress << ": " << txIp
+                             << " retransmitted uid=" << uid
+                             << " to an implausible hop " << receiver
+                             << "; not crediting the forward");
+                return;
+            }
             vec.erase(pp);
             s.packetsForwarded++;
             NS_LOG_DEBUG(m_mainAddress << " observed " << txIp
-                         << " forward packet uid=" << uid);
+                         << " forward packet uid=" << uid
+                         << " to " << receiver);
             return;
         }
     }
@@ -659,19 +783,71 @@ void
 OlsrWatchdogDefense::OnRtsReceived(Mac48Address sender, Mac48Address /*receiver*/)
 {
     if (!m_enabled) return;   // OFF => fully inert.
+    if (sender == m_myMacAddress)
+    {
+        return; // Our own RTS; says nothing about a monitored node.
+    }
     Ipv4Address ip = LookupIpFromMac(sender);
     if (ip == Ipv4Address())
     {
         return;
     }
-    m_neighborStats[ip].rtsFromThisNode++;
+    NeighborStats& s = m_neighborStats[ip];
+    s.rtsFromThisNode++;   // cumulative, retained for logging
+    s.rtsInWindow++;       // per-round, feeds the collision test
 }
 
 void
-OlsrWatchdogDefense::OnCtsReceived(Mac48Address /*receiver*/)
+OlsrWatchdogDefense::OnCtsReceived(Mac48Address rtsSender)
 {
-    // Currently informational only. Reserved for future refinement
-    // where we correlate observed CTS-to-B with B's forwarding behavior.
+    // An 802.11 CTS carries a single address field (Addr1/RA) holding the
+    // address of the station whose RTS is being cleared. Overhearing it
+    // therefore tells us that THAT station won the medium, so the frame is
+    // credited to it, and is what the RTS count is compared against.
+    if (!m_enabled) return;   // OFF => fully inert.
+    if (rtsSender == m_myMacAddress)
+    {
+        return; // Clears one of our own RTS frames, not a monitored node's.
+    }
+    Ipv4Address ip = LookupIpFromMac(rtsSender);
+    if (ip == Ipv4Address())
+    {
+        return;
+    }
+    m_neighborStats[ip].ctsInWindow++;
+}
+
+bool
+OlsrWatchdogDefense::CollisionSuspectedFor(const NeighborStats& s) const
+{
+    // Sum the current and previous rounds so that the test spans the whole
+    // lifetime of a pending packet (see B2 in DESIGN_DECISIONS.md).
+    const uint32_t rts = s.rtsInWindow + s.rtsPrevWindow;
+    const uint32_t cts = s.ctsInWindow + s.ctsPrevWindow;
+
+    // Guard against unsigned wraparound. CTS may legitimately exceed RTS when
+    // the node's RTS was transmitted out of our hearing but the CTS answering
+    // it was not; that is evidence of a clear medium, never of contention.
+    if (cts >= rts)
+    {
+        return false;
+    }
+    return (rts - cts) >= m_rtsCtsDiscrepancyThresh;
+}
+
+void
+OlsrWatchdogDefense::RotateMacWindows()
+{
+    for (auto& kv : m_neighborStats)
+    {
+        NeighborStats& s = kv.second;
+        s.rtsPrevWindow = s.rtsInWindow;
+        s.ctsPrevWindow = s.ctsInWindow;
+        s.rtsInWindow = 0;
+        s.ctsInWindow = 0;
+    }
+    m_selfDropsPrevWindow = m_selfDropsWindow;
+    m_selfDropsWindow = 0;
 }
 
 void
@@ -680,7 +856,7 @@ OlsrWatchdogDefense::PhyRxDropCallback(Ptr<const Packet> /*pkt*/,
 {
     if (!m_enabled) return;   // OFF => fully inert.
     // Every PHY drop is a signal that we, the watchdog, might be missing
-    // observations. Algorithm B feeds this into m_selfReliabilityScore.
+    // observations. Feeds MAC_s (Alg. 4 Part B) via LocalMacStatus().
     m_selfDropsWindow++;
 }
 
@@ -737,8 +913,6 @@ OlsrWatchdogDefense::PeriodicCheck()
 
     const Time now = Simulator::Now();
 
-    UpdateSelfReliability();
-
     // 1. Age out pending packets whose timeout has expired; each expiry is
     //    an observation of "neighbor did not forward".
     for (auto kv = m_pendingByNeighbor.begin(); kv != m_pendingByNeighbor.end();)
@@ -776,7 +950,12 @@ OlsrWatchdogDefense::PeriodicCheck()
         MaybeBlacklist(kv.first);
     }
 
-    // 3. Reschedule.
+    // 3. Advance the MAC observation window. Deliberately AFTER steps 1 and 2:
+    //    the collision test in EvaluateMissingForward must see the counts that
+    //    were accumulating while the packet in question was in flight.
+    RotateMacWindows();
+
+    // 4. Reschedule.
     m_periodicEvent = Simulator::Schedule(m_periodicInterval,
                                           &OlsrWatchdogDefense::PeriodicCheck,
                                           this);
@@ -794,9 +973,22 @@ OlsrWatchdogDefense::EvaluateMissingForward(Ipv4Address neighbor,
         return;
     }
 
+    // (a) MAC_s GATE (Baiad et al., Alg. 4 Part B). If this watchdog was
+    //     itself colliding while listening, it is eliminated from this round
+    //     rather than accusing on evidence it could not reliably gather.
+    //     Checked before any per-neighbour reasoning: the disqualification is
+    //     a property of the monitor, not of the monitored node.
+    if (!LocalMacStatus())
+    {
+        NS_LOG_DEBUG(m_mainAddress << ": MAC_s=0 (local drops="
+                     << (m_selfDropsWindow + m_selfDropsPrevWindow)
+                     << "), abstaining this round");
+        return;
+    }
+
     NeighborStats& s = m_neighborStats[neighbor];
 
-    // (a) If our link to this neighbor was failing at the MAC layer, the
+    // (b) If our link to this neighbor was failing at the MAC layer, the
     //     neighbor never received our packet. Cannot blame them.
     if (s.macTxFailures > m_macFailureThreshold)
     {
@@ -805,24 +997,27 @@ OlsrWatchdogDefense::EvaluateMissingForward(Ipv4Address neighbor,
         return;
     }
 
-    // (b) Heuristic from user-summary: if the neighbor has been transmitting
-    //     many RTS but almost no DATA, it is likely a blackhole pretending
-    //     to try to forward. Attach extra weight.
-    const bool manyRts = s.rtsFromThisNode > m_minRtsForHeuristic;
-    const bool lowData = s.dataFromThisNode == 0 ||
-                         (static_cast<double>(s.rtsFromThisNode) /
-                              static_cast<double>(std::max<uint32_t>(1, s.dataFromThisNode))
-                          > m_rtsToDataRatioThresh);
-    if (manyRts && lowData)
+    // (c) CROSS-LAYER TEST (Baiad et al. [B14] §IV-B, [B16] §3.2, Alg. 4 Part A).
+    //     The MAC monitor compares the number of RTS frames the node sent
+    //     against the number of CTS frames it was granted. A shortfall means
+    //     the node was contending for a channel it did not win, so the missing
+    //     forward is attributable to collision rather than to an intentional
+    //     drop, and the watchdog report is voided (`wd_report(i) = 0`).
+    //
+    //     This is the exculpatory direction the papers specify. An earlier
+    //     revision used RTS activity to INCRIMINATE, which inverted the
+    //     premise of the cross-layer design — the mechanism exists precisely
+    //     to suppress collision-induced false positives.
+    if (CollisionSuspectedFor(s))
     {
-        s.notForwardedEvidence += 2;
-        NS_LOG_DEBUG(m_mainAddress << ": +2 evidence vs " << neighbor
-                     << " (RTS=" << s.rtsFromThisNode
-                     << " DATA=" << s.dataFromThisNode << ")");
+        NS_LOG_DEBUG(m_mainAddress << ": voiding report vs " << neighbor
+                     << " (MAC contention: RTS="
+                     << (s.rtsInWindow + s.rtsPrevWindow)
+                     << " CTS=" << (s.ctsInWindow + s.ctsPrevWindow) << ")");
         return;
     }
 
-    // (c) Default: one piece of evidence. Will accumulate with repeated drops.
+    // (d) Default: one piece of evidence. Will accumulate with repeated drops.
     s.notForwardedEvidence++;
     NS_LOG_DEBUG(m_mainAddress << ": +1 evidence vs " << neighbor
                  << " (total=" << s.notForwardedEvidence << ")");
@@ -843,13 +1038,12 @@ OlsrWatchdogDefense::MaybeBlacklist(Ipv4Address neighbor)
     }
     NeighborStats& s = it->second;
 
-    // Self-reliability scales the effective threshold: the noisier we are,
-    // the more evidence we demand before accusing.
-    const double effectiveThreshold =
-        static_cast<double>(m_blacklistThreshold) / m_selfReliabilityScore;
-
-    // Not enough evidence yet -> nothing to do.
-    if (s.notForwardedEvidence < effectiveThreshold)
+    // Fixed threshold. Monitor reliability is handled upstream in
+    // EvaluateMissingForward, where a round in which this watchdog was itself
+    // colliding contributes no evidence at all (MAC_s = 0). Scaling the
+    // threshold by a continuous confidence score, as an earlier revision did,
+    // has no counterpart in Baiad et al. or in Marti et al.
+    if (s.notForwardedEvidence < m_blacklistThreshold)
     {
         return;
     }
@@ -947,24 +1141,22 @@ OlsrWatchdogDefense::MaybeBlacklist(Ipv4Address neighbor)
                 << " after probation"
                 << " (total evidence=" << s.notForwardedEvidence
                 << ", new during probation=" << evidenceDuringProbation
-                << ", DATA seen=" << s.dataFromThisNode
-                << ", selfReliability=" << m_selfReliabilityScore << ")");
+                << ", DATA seen=" << s.dataFromThisNode << ")");
 }
 
-void
-OlsrWatchdogDefense::UpdateSelfReliability()
+bool
+OlsrWatchdogDefense::LocalMacStatus() const
 {
-    if (m_selfDropsWindow > m_selfDropsThreshold)
-    {
-        m_selfReliabilityScore =
-            std::max(m_minSelfReliability, m_selfReliabilityScore * 0.9);
-    }
-    else
-    {
-        m_selfReliabilityScore =
-            std::min(1.0, m_selfReliabilityScore * 1.05);
-    }
-    m_selfDropsWindow = 0;
+    // MAC_s = 0 when this watchdog was itself losing frames to collisions
+    // over the observation window; in that case it cannot distinguish "the
+    // neighbour did not forward" from "I did not hear the neighbour forward",
+    // and the papers eliminate such a watchdog from the round entirely.
+    // Summed over two rounds for the same reason as the RTS/CTS counts, and
+    // compared against twice the threshold so that SelfDropsThreshold keeps
+    // its original meaning of "tolerated drops per round". Comparing a
+    // two-round sum against a one-round threshold would silently halve the
+    // configured tolerance and mute a watchdog sitting exactly at it.
+    return (m_selfDropsWindow + m_selfDropsPrevWindow) <= (2 * m_selfDropsThreshold);
 }
 
 } // namespace olsr

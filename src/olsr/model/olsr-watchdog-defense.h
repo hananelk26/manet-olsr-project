@@ -89,6 +89,7 @@ public:
         std::size_t neighborStats    = 0; //!< # neighbors tracked in m_neighborStats
         std::size_t macToIp          = 0; //!< # learned MAC->IP mappings
         std::size_t selfDropsWindow  = 0; //!< current local-PHY-drop counter
+        std::size_t selfDropsPrev    = 0; //!< previous-round local-PHY-drop counter
     };
     DebugStateSizes GetDebugStateSizes() const;
 
@@ -152,9 +153,26 @@ private:
         uint32_t packetsForwarded = 0;     //!< # we observed being retransmitted
         uint32_t notForwardedEvidence = 0; //!< Aggregate evidence of blackhole behavior
         uint32_t macTxFailures = 0;        //!< # times our RTS to them timed out
-        uint32_t rtsFromThisNode = 0;      //!< # RTS frames observed with them as sender
+        uint32_t rtsFromThisNode = 0;      //!< # RTS frames observed with them as sender (cumulative, logging only)
         uint32_t dataFromThisNode = 0;     //!< # DATA frames observed with them as sender
         Time lastActivityTime = Seconds(0);
+
+        // ---- MAC-layer collision evidence (Baiad et al., cross-layer test) ----
+        // The papers describe the MAC monitor as counting "the number of RTS
+        // sent and CTS received"; a discrepancy indicates that the loss was
+        // caused by channel contention rather than by an intentional drop, and
+        // the corresponding watchdog report is then voided (Alg. 4 Part A).
+        //
+        // Counts are kept per aggregation round. The collision test sums the
+        // current and the immediately preceding round, so that it covers the
+        // whole lifetime of a pending packet (which may have been forwarded
+        // before the current round began) without letting a single old
+        // discrepancy exonerate the neighbour indefinitely. See B2 in
+        // DESIGN_DECISIONS.md.
+        uint32_t rtsInWindow = 0;      //!< RTS frames sent by this node, current round
+        uint32_t ctsInWindow = 0;      //!< CTS frames addressed to it, current round
+        uint32_t rtsPrevWindow = 0;    //!< Same, previous round
+        uint32_t ctsPrevWindow = 0;    //!< Same, previous round
 
         // ---- Probation fields (anti false-positive) ----
         // Once accumulated evidence first crosses the blacklist threshold, the
@@ -180,9 +198,12 @@ private:
     std::map<Ipv4Address, NeighborStats> m_neighborStats;
     std::map<Mac48Address, Ipv4Address> m_macToIp;
 
-    // Algorithm B: self-reliability (lowers watchdog confidence when itself is noisy)
-    uint32_t m_selfDropsWindow;        //!< Local PHY drops accumulated this window.
-    double m_selfReliabilityScore;     //!< In [m_minSelfReliability, 1.0].
+    // Algorithm 4 Part B (Baiad et al.): MAC_s, the binary status of this
+    // node as a monitor. A watchdog that was itself suffering collisions
+    // while listening is eliminated from the aggregation for that round
+    // (weight 0) rather than having its confidence merely reduced.
+    uint32_t m_selfDropsWindow;        //!< Local PHY drops, current round.
+    uint32_t m_selfDropsPrevWindow;    //!< Local PHY drops, previous round.
 
     // Periodic timer
     EventId m_periodicEvent;
@@ -204,6 +225,8 @@ private:
     double m_minSelfReliability;
     double m_macFailureRateThresh;     //!< MAC fail-rate above which link deemed unhealthy
     uint32_t m_minDataObservations;    //!< Min DATA frames seen from neighbor before blacklisting
+    uint32_t m_rtsCtsDiscrepancyThresh; //!< (RTS - CTS) at or above which contention is inferred
+    bool m_verifyOnwardHop;            //!< Enable the [M00] onward-hop check
 
     // Runtime master switch. When false, IsMalicious() returns false for
     // all addresses (effectively disabling the blacklist) and PeriodicCheck
@@ -266,8 +289,48 @@ private:
     /** Checks whether accumulated evidence warrants blacklisting. */
     void MaybeBlacklist(Ipv4Address neighbor);
 
-    /** Adjusts self-reliability based on local drop window count. */
-    void UpdateSelfReliability();
+    /** MAC_s for this node (Baiad et al., Alg. 4 Part B). Returns false when
+     *  this watchdog was itself losing frames to collisions over the
+     *  observation window, in which case it is disqualified from scoring for
+     *  that round instead of accusing on evidence it could not reliably
+     *  gather. Binary by design: the papers define MAC_s as 0 or 1. */
+    bool LocalMacStatus() const;
+
+    /** MAC-layer exculpatory test (Baiad et al.): true when the node issued
+     *  more RTS frames than the CTS it was granted over the observation
+     *  window, which indicates channel contention rather than an intentional
+     *  drop. A watchdog report against a node for which this holds is voided
+     *  rather than scored. */
+    bool CollisionSuspectedFor(const NeighborStats& s) const;
+
+    /** Verifies that a retransmission observed from `forwarder` was addressed
+     *  to a plausible onward hop rather than into the void.
+     *
+     *  Marti et al. [M00] §3.1 note that the watchdog "works best on top of a
+     *  source routing protocol", because the forwarder's own next hop is then
+     *  carried in the packet. Under a hop-by-hop protocol such as OLSR it is
+     *  not, and they warn that "a malicious or broken node could broadcast the
+     *  packet to a non-existant node and the watchdog would have no way of
+     *  knowing". This closes that hole as far as OLSR's link-state view
+     *  allows.
+     *
+     *  Returns false only when the destination can be shown to be bogus.
+     *  When the receiver cannot be resolved the method returns true: absence
+     *  of information is not treated as evidence of misbehaviour. */
+    bool IsPlausibleOnwardHop(Mac48Address receiver, Ipv4Address forwarder) const;
+
+    /** True if `addr` appears anywhere in this node's link-state view of the
+     *  network (neighbour set, two-hop neighbour set, or topology set). Used
+     *  by IsPlausibleOnwardHop to distinguish a real relay target from a
+     *  fabricated one. */
+    bool IsKnownNode(Ipv4Address addr) const;
+
+    /** Advances the observation window by one round: the current round's
+     *  per-neighbour RTS/CTS counters and this node's local drop counter
+     *  become the previous round's, and fresh counters are started. Called at
+     *  the end of PeriodicCheck, after pending packets have been evaluated
+     *  against the window. */
+    void RotateMacWindows();
 
     /** Attempt to read IPv4 source from a raw WiFi data MPDU. Returns false on failure. */
     bool TryExtractIpSource(Ptr<const Packet> rawWifiPkt, Ipv4Address& outSrc) const;
