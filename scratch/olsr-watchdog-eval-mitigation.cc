@@ -226,7 +226,7 @@ NS_LOG_COMPONENT_DEFINE ("OlsrWatchdogEvalMitigation");
 // Version markers (RUN-006 / reproducibility)
 // ============================================================================
 #define HARNESS_VERSION "2.4.0"
-#define HEADER_VERSION  4
+#define HEADER_VERSION  5
 
 // ============================================================================
 // Phase / window timing constants  (WIN-002: generalized, shared by both
@@ -590,6 +590,27 @@ static double   g_minAttackerTrust   = 1.0;
 static double   g_avgAttackerTrust   = 1.0;
 static uint32_t g_blacklistMaxSize   = 0;
 
+// --- Detection accuracy (Baiad et al. 2016, eq. 16; false alarm per §4.2) ---
+// Populated by the same sweep that fills the trust proxy above: every
+// non-attacker node's blacklist is already fetched there, so the accusations
+// are counted rather than collapsed into an aggregate.
+//   no_d           : accusations against nodes that really are attackers,
+//                    summed over watchdogs (duplicates intended -- the paper's
+//                    numerator is a sum over monitors, not a set).
+//   false_d        : accusations against nodes that are not attackers.
+//   watchdogsTotal : every node running the defense  (paper-literal denominator).
+//   watchdogsInRange: those that were 1-hop neighbours of some attacker, i.e.
+//                    that could physically have observed it. In the paper's
+//                    corridor topology these two nearly coincide; in a sparse
+//                    grid they do not, which is why both are reported.
+static uint32_t g_trueDetections     = 0;
+static uint32_t g_falseDetections    = 0;
+static uint32_t g_watchdogsTotal     = 0;
+static uint32_t g_watchdogsInRange   = 0;
+static double   g_detectionPercent   = 0.0;   // paper-literal denominator
+static double   g_detectionPercentInRange = 0.0;
+static double   g_falseAlarmRate     = 0.0;
+
 // Feature collector.
 static ns3::olsreval::FeatureCollector g_features;
 static bool                        g_featuresActive = false;
@@ -781,7 +802,9 @@ static const char* ORACLE_HEADER =
   "hello_count,olsr_control_bytes_with_hello,"
   "path_hops_internal,"
   "min_attacker_trust,avg_attacker_trust,blacklist_max_size,"
-  "mac_tx_in_window,mac_drop_in_window,mac_tx_total,mac_drop_total";
+  "mac_tx_in_window,mac_drop_in_window,mac_tx_total,mac_drop_total,"
+  "true_detections,false_detections,watchdogs_total,watchdogs_in_range,"
+  "detection_percent,detection_percent_in_range,false_alarm_rate";
 
 // FEATURES_HEADER is built from the identifier prefix + g_features header.
 static std::string BuildFeaturesHeader ()
@@ -1580,6 +1603,100 @@ SnapshotUdpReceived ()
 // LEAK-001/002: this now ONLY populates the global state for the
 // ORACLE row (not features). attacker_on_path goes to labels; trust
 // values and path_hops go to oracle.
+// ---------------------------------------------------------------------------
+// Detection accuracy (Baiad et al. 2016, eq. 16 and the false-alarm definition).
+//
+// TIMING IS LOAD-BEARING: this runs at the CLOSE of a measurement window.
+// Accusations accumulate DURING the window, so reading them at window start --
+// as ObserveAttackerOnPath does, by design, for its *PrevWindow fields -- would
+// report the previous slot's verdicts on this slot's row. For a defense-enabled
+// slot that is the difference between measuring the detector and measuring the
+// slot before it.
+//
+// Kept as a separate pass rather than folded into ObserveAttackerOnPath so that
+// min_attacker_trust and blacklist_max_size retain their established
+// start-of-window timing and cannot be perturbed by this addition.
+// ---------------------------------------------------------------------------
+static void
+SampleDetectionAccuracy (NodeContainer* nodes,
+                         std::vector<uint32_t> attackerIds)
+{
+  g_trueDetections          = 0;
+  g_falseDetections         = 0;
+  g_watchdogsTotal          = 0;
+  g_watchdogsInRange        = 0;
+  g_detectionPercent        = 0.0;
+  g_detectionPercentInRange = 0.0;
+  g_falseAlarmRate          = 0.0;
+
+  if (g_runRejected || nodes == nullptr) return;
+
+  const std::set<uint32_t> attIdSet (attackerIds.begin (), attackerIds.end ());
+
+  std::set<Ipv4Address> attackerAddrs;
+  for (uint32_t attId : attackerIds)
+    {
+      if (attId >= nodes->GetN ()) continue;
+      Ptr<olsr::RoutingProtocol> ap = GetOlsrProtocol (nodes->Get (attId));
+      if (ap) attackerAddrs.insert (ap->GetMainAddress ());
+    }
+  if (attackerAddrs.empty ()) return;
+
+  uint32_t trueDet = 0, falseDet = 0, wdTotal = 0, wdInRange = 0;
+
+  for (uint32_t i = 0; i < nodes->GetN (); ++i)
+    {
+      if (attIdSet.count (i)) continue;           // attackers are not watchdogs
+      Ptr<olsr::RoutingProtocol> proto = GetOlsrProtocol (nodes->Get (i));
+      if (!proto) continue;
+      PointerValue pv;
+      proto->GetAttribute ("DefenseStrategy", pv);
+      Ptr<olsr::OlsrDefenseStrategy> def =
+          DynamicCast<olsr::OlsrDefenseStrategy> (pv.Get<olsr::OlsrDefenseStrategy> ());
+      if (!def) continue;
+
+      ++wdTotal;
+
+      // Only a one-hop neighbour can overhear a relay, so only such a node had
+      // any opportunity to detect. This separates the two denominators.
+      for (const auto& nb : proto->GetNeighbors ())
+        if (attackerAddrs.count (nb.neighborMainAddr)) { ++wdInRange; break; }
+
+      for (const Ipv4Address& accused : def->GetBlacklist ())
+        {
+          if (attackerAddrs.count (accused)) ++trueDet;
+          else                               ++falseDet;
+        }
+    }
+
+  g_trueDetections   = trueDet;
+  g_falseDetections  = falseDet;
+  g_watchdogsTotal   = wdTotal;
+  g_watchdogsInRange = wdInRange;
+
+  const double noMalicious = static_cast<double> (attackerAddrs.size ());
+  if (wdTotal > 0)
+    {
+      g_detectionPercent =
+          100.0 * static_cast<double> (trueDet) /
+          (static_cast<double> (wdTotal) * noMalicious);
+    }
+  if (wdInRange > 0)
+    {
+      g_detectionPercentInRange =
+          100.0 * static_cast<double> (trueDet) /
+          (static_cast<double> (wdInRange) * noMalicious);
+    }
+
+  const uint32_t totalDet = trueDet + falseDet;
+  if (totalDet > 0)
+    {
+      g_falseAlarmRate =
+          100.0 * static_cast<double> (falseDet) /
+          static_cast<double> (totalDet);
+    }
+}
+
 static void
 ObserveAttackerOnPath (NodeContainer* nodes,
                        std::vector<uint32_t> attackerIds,
@@ -1627,6 +1744,7 @@ ObserveAttackerOnPath (NodeContainer* nodes,
   uint32_t samples = 0;
   double minTrust  = 1.0;
   uint32_t maxBlSz = 0;
+
 
   for (uint32_t i = 0; i < nodes->GetN (); ++i)
     {
@@ -2013,7 +2131,11 @@ EndMeasurementWindow (const std::string& scenarioName,
             << g_minAttackerTrust << "," << g_avgAttackerTrust << ","
             << g_blacklistMaxSize << ","
             << macTxInWin << "," << macDropInWin << ","
-            << macTxTotal << "," << macDropTotal << "\n";
+            << macTxTotal << "," << macDropTotal << ","
+            << g_trueDetections << "," << g_falseDetections << ","
+            << g_watchdogsTotal << "," << g_watchdogsInRange << ","
+            << g_detectionPercent << "," << g_detectionPercentInRange << ","
+            << g_falseAlarmRate << "\n";
   g_staging.oracleRows.push_back (oracleRow.str ());
 
   // ---- Labels row ----
@@ -2270,14 +2392,21 @@ WriteDefenseParamsOnce (const SimulationConfig& cfg)
          << "periodic_interval_s=1.0\n"
          << "warmup_duration_s=15.0\n"
          << "blacklist_threshold=3\n"
-         << "rts_to_data_ratio_threshold=3.0\n"
          << "self_drops_threshold=5\n"
          << "mac_failure_threshold=3\n"
-         << "min_rts_for_heuristic=5\n"
-         << "min_self_reliability=0.6\n"
          << "probation_duration_s=2.0\n"
          << "mac_failure_rate_threshold=0.4\n"
-         << "min_data_observations=2\n";
+         << "min_data_observations=2\n"
+         // Cross-layer test aligned with Baiad et al.: RTS/CTS evidence now
+         // exonerates rather than incriminates, MAC_s is binary, and observed
+         // relays are checked against a plausible onward hop.
+         << "rts_cts_discrepancy_threshold=1\n"
+         << "verify_onward_hop=true\n"
+         // Superseded. Still accepted as attributes so that older harness
+         // invocations keep running, but no longer on the decision path.
+         << "rts_to_data_ratio_threshold=INERT\n"
+         << "min_rts_for_heuristic=INERT\n"
+         << "min_self_reliability=INERT\n";
       const std::string s = os.str ();
       ssize_t w = write (fd, s.c_str (), s.size ());
       (void) w;
@@ -2703,6 +2832,12 @@ main (int argc, char* argv[])
     Simulator::Schedule (Seconds (startTime - 2.0),
                          &ObserveAttackerOnPath, &nodes, attackerIds,
                          flowAddrPairs);
+    // Detection accuracy is read at the CLOSE of the window, a millisecond
+    // before EndSlot emits the oracle row at winEnd. See the comment on
+    // SampleDetectionAccuracy: reading it at window start would attribute the
+    // previous slot's verdicts to this row.
+    Simulator::Schedule (Seconds (winEnd - 0.001),
+                         &SampleDetectionAccuracy, &nodes, attackerIds);
   };
 
   for (int slot = 0; slot < NUM_SLOTS; ++slot)
