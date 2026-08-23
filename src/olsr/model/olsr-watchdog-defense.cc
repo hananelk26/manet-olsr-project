@@ -152,6 +152,22 @@ OlsrWatchdogDefense::GetTypeId()
                       UintegerValue(2),
                       MakeUintegerAccessor(&OlsrWatchdogDefense::m_minDataObservations),
                       MakeUintegerChecker<uint32_t>())
+        .AddAttribute("BlacklistDuration",
+                      "How long a blacklist verdict stands before the node is "
+                      "readmitted to routing with its evidence reset. Marti et "
+                      "al. recommend restoring a condemned node 'after a long "
+                      "timeout' so that a temporary malfunction or an "
+                      "incorrect accusation does not exclude it permanently, "
+                      "and note that they did not implement this. Neither "
+                      "Baiad et al. paper specifies a response to detection at "
+                      "all, so no value is inherited from them; 30 s is chosen "
+                      "as long relative to the 2 s probation and 15 s warmup, "
+                      "yet short enough to act within a 40 s measurement "
+                      "window. Set to 0 to make verdicts permanent, "
+                      "reproducing the earlier behaviour.",
+                      TimeValue(Seconds(30.0)),
+                      MakeTimeAccessor(&OlsrWatchdogDefense::m_blacklistDuration),
+                      MakeTimeChecker())
         .AddAttribute("VerifyOnwardHop",
                       "Require that a retransmission observed from a "
                       "monitored node be addressed to a plausible onward hop "
@@ -950,12 +966,15 @@ OlsrWatchdogDefense::PeriodicCheck()
         MaybeBlacklist(kv.first);
     }
 
-    // 3. Advance the MAC observation window. Deliberately AFTER steps 1 and 2:
+    // 3. Release blacklist entries whose term has expired ([M00] §3.2).
+    ReleaseExpiredBlacklist();
+
+    // 4. Advance the MAC observation window. Deliberately AFTER steps 1 and 2:
     //    the collision test in EvaluateMissingForward must see the counts that
     //    were accumulating while the packet in question was in flight.
     RotateMacWindows();
 
-    // 4. Reschedule.
+    // 5. Reschedule.
     m_periodicEvent = Simulator::Schedule(m_periodicInterval,
                                           &OlsrWatchdogDefense::PeriodicCheck,
                                           this);
@@ -1136,12 +1155,58 @@ OlsrWatchdogDefense::MaybeBlacklist(Ipv4Address neighbor)
 
     // Persistent misbehavior across probation -> commit.
     m_blacklist.insert(neighbor);
+    s.blacklistedAt = Simulator::Now();   // starts the release clock
     NS_LOG_WARN("Node " << m_mainAddress
                 << " BLACKLISTED " << neighbor
                 << " after probation"
                 << " (total evidence=" << s.notForwardedEvidence
                 << ", new during probation=" << evidenceDuringProbation
                 << ", DATA seen=" << s.dataFromThisNode << ")");
+}
+
+void
+OlsrWatchdogDefense::ReleaseExpiredBlacklist()
+{
+    if (m_blacklistDuration == Seconds(0))
+    {
+        return;   // verdicts are permanent
+    }
+
+    const Time now = Simulator::Now();
+
+    for (auto it = m_blacklist.begin(); it != m_blacklist.end(); )
+    {
+        auto st = m_neighborStats.find(*it);
+
+        // An entry with no stats cannot be aged; leave it rather than guess.
+        if (st == m_neighborStats.end() || st->second.blacklistedAt == Seconds(0))
+        {
+            ++it;
+            continue;
+        }
+
+        if (now - st->second.blacklistedAt < m_blacklistDuration)
+        {
+            ++it;
+            continue;
+        }
+
+        // Term served. Readmit with a clean slate: keeping the evidence that
+        // condemned the node would put it straight back on the list at the
+        // next dropped packet, which is the permanence this is meant to undo.
+        NeighborStats& ns = st->second;
+        ns.notForwardedEvidence = 0;
+        ns.onProbation = false;
+        ns.probationUntil = Seconds(0);
+        ns.evidenceAtProbationStart = 0;
+        ns.blacklistedAt = Seconds(0);
+
+        NS_LOG_INFO(m_mainAddress << ": RELEASED " << *it
+                    << " from blacklist after " << m_blacklistDuration.GetSeconds()
+                    << "s; evidence reset, must be re-detected");
+
+        it = m_blacklist.erase(it);
+    }
 }
 
 bool

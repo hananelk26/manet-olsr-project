@@ -184,6 +184,16 @@ private:
         bool onProbation = false;
         Time probationUntil = Seconds(0);
         uint32_t evidenceAtProbationStart = 0;
+
+
+        // ---- Blacklist release ([M00] §3.2) ----
+        // Marti et al.: "If a node is marked as misbehaving due to a temporary
+        // malfunction or incorrect accusation it would be preferrable if it
+        // were not permanently excluded from routing. Therefore nodes that
+        // have negative ratings should have their ratings slowly increased or
+        // set back to a non-negative value after a long timeout." They record
+        // that they did not implement this. We do.
+        Time blacklistedAt = Seconds(0);
     };
 
     // ----- Members -----
@@ -226,7 +236,9 @@ private:
     double m_macFailureRateThresh;     //!< MAC fail-rate above which link deemed unhealthy
     uint32_t m_minDataObservations;    //!< Min DATA frames seen from neighbor before blacklisting
     uint32_t m_rtsCtsDiscrepancyThresh; //!< (RTS - CTS) at or above which contention is inferred
+    Time m_blacklistDuration;          //!< How long a verdict stands; 0 = forever
     bool m_verifyOnwardHop;            //!< Enable the [M00] onward-hop check
+    Time m_blacklistDuration;          //!< How long a verdict holds; 0 = forever
 
     // Runtime master switch. When false, IsMalicious() returns false for
     // all addresses (effectively disabling the blacklist) and PeriodicCheck
@@ -288,6 +300,16 @@ private:
 
     /** Checks whether accumulated evidence warrants blacklisting. */
     void MaybeBlacklist(Ipv4Address neighbor);
+
+
+    /** Releases blacklist entries whose term has expired, per [M00] §3.2.
+     *  A released neighbour returns to the routing computation with its
+     *  evidence reset, so that a genuine attacker must be re-detected on fresh
+     *  observations rather than on the stale count that condemned it. A
+     *  genuine attacker is re-blacklisted within a few dropped packets; a node
+     *  wrongly accused after a link break stays free. No-op when
+     *  BlacklistDuration is zero. */
+    void ReleaseExpiredBlacklist();
 
     /** MAC_s for this node (Baiad et al., Alg. 4 Part B). Returns false when
      *  this watchdog was itself losing frames to collisions over the
