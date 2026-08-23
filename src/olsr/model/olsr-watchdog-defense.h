@@ -238,7 +238,6 @@ private:
     uint32_t m_rtsCtsDiscrepancyThresh; //!< (RTS - CTS) at or above which contention is inferred
     Time m_blacklistDuration;          //!< How long a verdict stands; 0 = forever
     bool m_verifyOnwardHop;            //!< Enable the [M00] onward-hop check
-    Time m_blacklistDuration;          //!< How long a verdict holds; 0 = forever
 
     // Runtime master switch. When false, IsMalicious() returns false for
     // all addresses (effectively disabling the blacklist) and PeriodicCheck
