@@ -222,11 +222,60 @@ using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE ("OlsrWatchdogEvalMitigation");
 
+// ---------------------------------------------------------------------------
+// PORTED FROM THE FPNT HARNESS (this build brings watchdog from 2.4.0 to
+// 3.0.0). Four changesets land at once; they are described in the FPNT file
+// and are byte-equivalent here except where the watchdog API differs.
+//
+//   TRF-006  The minimum-hop-distance acceptance criterion is REMOVED.
+//            AssertMinHops -> AssertRouteExists: a run is rejected only when
+//            OLSR has no route for a flow at all ("no_route_to_victim"). The
+//            "too_close" rejection, --minHops, the (minHops-1)*radioRange
+//            geometric filter in SelectDataFlowPairs, and the
+//            min_hops_required column of runs.csv are all gone. Runs that
+//            earlier versions rejected as too_close are now ACCEPTED, so the
+//            accepted-run population differs from earlier harness versions.
+//
+//   WIN-003  The 60 s neutral prologue is needed ONLY when the window order is
+//            randomized. In canonical order slot 0 IS "baseline", so its own
+//            60 s slot stabilization already is that prologue:
+//              canonical = 4 x 100 = 400 s, mixed = 60 + 400 = 460 s.
+//            Slot timings become runtime values derived from
+//            g_initialStabilization. The gates keep firing at a fixed
+//            t = ACCEPTANCE_GATE_TIME = 60 s, neutral in both modes.
+//
+//   SL-2     THE SINGLE LISTENER. Every feature feed now comes from ONE node's
+//            RECEIVE path (Phy/MonitorSnifferRx on that node alone) instead of
+//            the network-wide PhyTxBegin + Ipv4::Tx vantage this harness used.
+//            The listener defaults to the first attacker id and is overridable
+//            with --listenerNode; it is recorded in runs.csv as listener_node.
+//
+//   SL-3     THE LISTENER-17 SCHEMA. olsr_window_features.h now emits exactly
+//            the 17 single-listener observables of the reference harness
+//            iolsr-tests-corrected.cc. One entry point,
+//            ObserveSniffedFrame(), takes the raw PSDU and parses it itself.
+//            The RTS/CTS/ACK filter and the HELLO filter are REMOVED (the
+//            reference counts both), and with them a bug: the HELLO case
+//            carried a `return` that exited the whole callback, so a TC
+//            sharing an OLSR packet with a preceding HELLO was silently
+//            dropped. FEATURE_MODE is gone -- one block, 17 columns.
+//
+// DELIBERATELY UNCHANGED: the seven watchdog-specific detection columns of
+// windows_oracle.csv (true_detections, false_detections, defenders_total,
+// defenders_in_range, detection_percent, detection_percent_in_range,
+// false_alarm_rate) and SampleDetectionAccuracy() that fills them. They read
+// defense state directly across the whole network, which is exactly right for
+// an ORACLE column and is unaffected by the single-listener change. Their
+// window-close timing is likewise preserved.
+//
+// HEADER_VERSION 5 -> 7; HARNESS_VERSION 2.4.0 -> 3.0.0.
+// ---------------------------------------------------------------------------
+
 // ============================================================================
 // Version markers (RUN-006 / reproducibility)
 // ============================================================================
-#define HARNESS_VERSION "2.4.0"
-#define HEADER_VERSION  5
+#define HARNESS_VERSION "3.0.0"
+#define HEADER_VERSION  8
 
 // ============================================================================
 // Phase / window timing constants  (WIN-002: generalized, shared by both
@@ -250,16 +299,29 @@ NS_LOG_COMPONENT_DEFINE ("OlsrWatchdogEvalMitigation");
 // Fixed (canonical) and randomized modes share this timeline; they differ
 // only in which scenario is assigned to which slot (see g_scenarioOrder).
 // Every window gets an identical 60 s post-transition stabilization.
-static constexpr double INITIAL_STABILIZATION  = 60.0;
+// WIN-003: the neutral prologue exists only so the acceptance gates can run in
+// the neutral state when slot 0 might carry attack and/or defense. In canonical
+// order slot 0 is ALWAYS "baseline", so its own 60 s slot stabilization already
+// IS that prologue:
+//   canonical order : g_initialStabilization = 0  -> SIMULATION_END = 400 s
+//   mixed     order : g_initialStabilization = 60 -> SIMULATION_END = 460 s
+// In BOTH modes the gates fire at ACCEPTANCE_GATE_TIME = 60 s, neutral.
+static constexpr double MIXED_INITIAL_STABILIZATION = 60.0;
+static constexpr double ACCEPTANCE_GATE_TIME        = 60.0;
 static constexpr double SLOT_STABILIZATION     = 60.0;
 static constexpr double MEASUREMENT_DURATION   = 40.0;
 static constexpr double SLOT_DURATION          =
     SLOT_STABILIZATION + MEASUREMENT_DURATION;          // 100.0
 static constexpr int    NUM_SLOTS              = 4;
 
-static constexpr double SIMULATION_END  =
-    INITIAL_STABILIZATION + NUM_SLOTS * SLOT_DURATION;  // 60 + 400 = 460
-static constexpr double SIMULATION_TAIL = SIMULATION_END + 2.0;  // 462
+// Length of the neutral prologue for THIS run. Fixed once in main() from
+// --randomWindowOrder, before anything is scheduled (WIN-003).
+static double g_initialStabilization = 0.0;
+
+static double SimulationEnd ()
+{ return g_initialStabilization + NUM_SLOTS * SLOT_DURATION; }   // 400 or 460
+static double SimulationTail ()
+{ return SimulationEnd () + 2.0; }                               // 402 or 462
 
 static constexpr double UDP_START_OFFSET_IN_WINDOW = 4.0;
 static constexpr uint32_t UDP_PACKETS_PER_WINDOW   = 18;
@@ -283,10 +345,10 @@ static constexpr uint16_t UDP_PORT                 = 80;
 //   * UDP_EXPECTED_PER_WINDOW = 1 x 18 = 18, so the oracle's
 //     udp_expected_in_window column and the udp_loss_percent denominator are
 //     computed against 18;
-//   * the t=60 AssertMinHops() gate arbitrates that ONE pair and rejects the
-//     run ("too_close") unless the OLSR distance node1 -> node0 is at least
-//     --minHops (default 3) hops, i.e. in every ACCEPTED run the sender and
-//     the receiver are at least 3 hops apart;
+//   * the t=60 AssertRouteExists() gate arbitrates that ONE pair and rejects
+//     the run ("no_route_to_victim") only when OLSR has no route at all from
+//     node1 to node0. TRF-006: there is NO minimum hop-distance requirement
+//     any more -- sender and receiver may be any number of hops apart;
 //   * the offered application load is 18 x 512 B per 40 s window
 //     (~1.8 kb/s) -- far below channel saturation.
 static constexpr uint32_t NUM_DATA_FLOWS = 1;
@@ -301,11 +363,13 @@ static constexpr uint32_t UDP_EXPECTED_PER_WINDOW =
     NUM_DATA_FLOWS * UDP_PACKETS_PER_WINDOW;
 
 // Slot timing helpers (callable with a runtime slot index).
-static constexpr double SlotTransitionTime (int k)
-{ return INITIAL_STABILIZATION + k * SLOT_DURATION; }
-static constexpr double SlotWindowStart (int k)
-{ return INITIAL_STABILIZATION + k * SLOT_DURATION + SLOT_STABILIZATION; }
-static constexpr double SlotWindowEnd (int k)
+// Slot timing helpers (callable with a runtime slot index). They read
+// g_initialStabilization, which main() fixes before any event is scheduled.
+static double SlotTransitionTime (int k)
+{ return g_initialStabilization + k * SLOT_DURATION; }
+static double SlotWindowStart (int k)
+{ return g_initialStabilization + k * SLOT_DURATION + SLOT_STABILIZATION; }
+static double SlotWindowEnd (int k)
 { return SlotWindowStart (k) + MEASUREMENT_DURATION; }
 
 // ============================================================================
@@ -376,6 +440,13 @@ DeterministicDraw (std::mt19937& rng, uint32_t bound)
 static constexpr uint32_t UDP_SERVER_NODE_ID = 0;
 static constexpr uint32_t UDP_CLIENT_NODE_ID = 1;
 
+// SL-2: the SINGLE listener. Exactly one node's radio feeds the feature
+// collector; the only live Observe* call comes from its Phy/MonitorSnifferRx.
+// Resolved in main() from --listenerNode, defaulting to the first attacker id.
+static constexpr uint32_t LISTENER_NODE_UNSET =
+    std::numeric_limits<uint32_t>::max ();
+static uint32_t g_listenerNodeId = LISTENER_NODE_UNSET;
+
 // TRF-001: deterministic per-run selection of the data-flow (src,dst) pairs.
 //
 // Flow 0 is ALWAYS the legacy pair (UDP_CLIENT_NODE_ID -> UDP_SERVER_NODE_ID),
@@ -387,14 +458,12 @@ static constexpr uint32_t UDP_CLIENT_NODE_ID = 1;
 //     NUM_DATA_FLOWS distinct sources and NUM_DATA_FLOWS distinct
 //     destinations, maximal topological diversity, exactly one UdpServer
 //     per node,
-//   * the straight-line distance of every selected pair exceeds
-//     (minHops-1)*radioRange. Under RangePropagationLossModel one hop covers
-//     at most radioRange metres, so ANY route between such a pair --
-//     including the OLSR route checked by the t=60 gate -- must have at
-//     least minHops hops. The geometric filter therefore guarantees the
-//     extended AssertMinHops gate passes for the added pairs whenever a
-//     route exists at all (and AssertConnectivity already rejects runs in
-//     which any route is missing).
+//   * TRF-006: there is no longer any lower bound on the straight-line
+//     distance of a selected pair. The geometric (minHops-1)*radioRange
+//     filter went away together with the minimum-hop-distance gate; the only
+//     remaining acceptance criteria are that a route exists for every flow
+//     (AssertRouteExists) and that the topology is connected
+//     (AssertConnectivity).
 //
 // Determinism (mirror of WIN-001): every draw comes from a SEPARATE
 // std::mt19937 (seeded by the caller from --seed and --run) using the same
@@ -410,7 +479,7 @@ static constexpr uint32_t UDP_CLIENT_NODE_ID = 1;
 static std::vector<std::pair<uint32_t, uint32_t>>
 SelectDataFlowPairs (NodeContainer& nodes,
                      const std::set<uint32_t>& attackerSet,
-                     uint32_t minHops, double radioRange, uint32_t pairSeed)
+                     uint32_t pairSeed)
 {
   std::vector<std::pair<uint32_t, uint32_t>> flows;
   flows.emplace_back (UDP_CLIENT_NODE_ID, UDP_SERVER_NODE_ID);  // legacy flow 0
@@ -428,8 +497,9 @@ SelectDataFlowPairs (NodeContainer& nodes,
     const double dz = pos[a].z - pos[b].z;
     return std::sqrt (dx * dx + dy * dy + dz * dz);
   };
-  const double minDist =
-      (minHops >= 1) ? (minHops - 1) * radioRange : 0.0;
+  // TRF-006: no geometric lower bound any more (the minimum-hop-distance
+  // requirement is gone), so any two distinct endpoints are acceptable.
+  const double minDist = 0.0;
 
   // Candidate endpoints: everything except attackers and the endpoints
   // already consumed by flow 0 (nodes 0 and 1).
@@ -476,11 +546,9 @@ SelectDataFlowPairs (NodeContainer& nodes,
           }
       if (!made)
         {
-          // No remaining pair satisfies the geometric bound (essentially
-          // impossible for the default 50-node 750x1000 m grid). Fall back
-          // to the maximum-distance remaining pair; the extended t=60 OLSR
-          // gate stays the single acceptance arbiter and rejects the run
-          // ("too_close") if the pair is genuinely too close.
+          // Unreachable with the TRF-006 zero bound; kept for safety, as it
+          // could only trigger if two candidates were exactly co-located.
+          // Falls back to the maximum-distance remaining pair.
           std::size_t bi = 0, bj = 1;
           double best = -1.0;
           for (std::size_t a = 0; a < cand.size (); ++a)
@@ -525,7 +593,8 @@ struct SimulationConfig
   uint32_t    spoofCount         = 5;
   double      attackerJitter     = 25.0;
 
-  uint32_t    minHops            = 3;
+  // SL-2: -1 (the default) means "use the first attacker id".
+  int32_t     listenerNode       = -1;
 
   bool     redundantMpr            = false;
   double   maliciousThreshold      = 0.2;
@@ -594,19 +663,26 @@ static uint32_t g_blacklistMaxSize   = 0;
 // Populated by the same sweep that fills the trust proxy above: every
 // non-attacker node's blacklist is already fetched there, so the accusations
 // are counted rather than collapsed into an aggregate.
-//   no_d           : accusations against nodes that really are attackers,
-//                    summed over watchdogs (duplicates intended -- the paper's
-//                    numerator is a sum over monitors, not a set).
-//   false_d        : accusations against nodes that are not attackers.
-//   watchdogsTotal : every node running the defense  (paper-literal denominator).
-//   watchdogsInRange: those that were 1-hop neighbours of some attacker, i.e.
-//                    that could physically have observed it. In the paper's
-//                    corridor topology these two nearly coincide; in a sparse
-//                    grid they do not, which is why both are reported.
+//
+// The metric is DEFENSE-AGNOSTIC: it counts accusations, and every defense in
+// this family exposes them through the base-class GetBlacklist(). Nothing here
+// assumes a watchdog, which is why the columns are named "defenders_*" rather
+// than after any one defense -- the four harnesses emit an identical oracle
+// schema so their windows_oracle.csv files concatenate directly.
+//   no_d            : accusations against nodes that really are attackers,
+//                     summed over defenders (duplicates intended -- the
+//                     paper's numerator is a sum over monitors, not a set).
+//   false_d         : accusations against nodes that are not attackers.
+//   defendersTotal  : every node running the defense (paper-literal
+//                     denominator).
+//   defendersInRange: those that were 1-hop neighbours of some attacker, i.e.
+//                     that could physically have observed it. In the paper's
+//                     corridor topology these two nearly coincide; in a sparse
+//                     grid they do not, which is why both are reported.
 static uint32_t g_trueDetections     = 0;
 static uint32_t g_falseDetections    = 0;
-static uint32_t g_watchdogsTotal     = 0;
-static uint32_t g_watchdogsInRange   = 0;
+static uint32_t g_defendersTotal     = 0;
+static uint32_t g_defendersInRange   = 0;
 static double   g_detectionPercent   = 0.0;   // paper-literal denominator
 static double   g_detectionPercentInRange = 0.0;
 static double   g_falseAlarmRate     = 0.0;
@@ -615,25 +691,10 @@ static double   g_falseAlarmRate     = 0.0;
 static ns3::olsreval::FeatureCollector g_features;
 static bool                        g_featuresActive = false;
 
-// ============================================================================
-// FEATURE OUTPUT MODE  (single source of truth for header AND rows)
-// ----------------------------------------------------------------------------
-// Selects which feature columns the features CSV (windows_features.csv) and the
-// --emit-header output contain. BOTH BuildFeaturesHeader() (the header) and the
-// per-window EmitFeatureCsv() (the rows) read THIS one constant, so the header
-// and the rows can never go out of sync. To switch: change the value below and
-// rebuild (./ns3 build). See FEATURE_MODE_USAGE.md for the full per-option guide.
-//
-//   FeatureMode::Core       group A-K only  (DEFAULT, 95 cols; byte-identical
-//                            to the pre-parity behaviour -- nothing changes).
-//   FeatureMode::CoreAndV2   A-K + strict_observable_v2 parity group L
-//                            (95 + 33 = 128 cols).
-//   FeatureMode::V2Only      only the parity group L (33 cols, named exactly
-//                            like defense_detection_v2.py's METRICS list).
-static const ns3::olsreval::FeatureCollector::FeatureMode FEATURE_MODE =
-    ns3::olsreval::FeatureCollector::FeatureMode::CoreAndV2;
-
-// PHY-trace availability flag (OBS-002b / DEG-003).
+// SL-3: "did the listener's MonitorSnifferRx attach". Written to runs.csv as
+// phy_trace_available. When false, the collector is never fed and every
+// feature column emits 0. There is no feature-mode switch any more: the
+// collector emits exactly one block of 17 LISTENER columns.
 static bool g_phyTraceAvailable = false;
 
 static Ptr<FlowMonitor>       g_flowMonitor = nullptr;
@@ -675,62 +736,15 @@ static NodeContainer*         g_simNodes          = nullptr;
 static bool                   g_debugDefenseState = false;
 
 static std::map<Ipv4Address, uint32_t> g_ipToNode;
-static std::map<uint32_t, Mac48Address> g_nodeToMac;       // for first-hop-MAC
+static std::map<uint32_t, Mac48Address> g_nodeToMac;       // diagnostics only (SL-3)
 static Ipv4Address            g_clientIp;
 
-// TRF-001/002: the per-run selected data flows (node-id pairs;
-// g_flowPairs[0] is ALWAYS the legacy node1 -> node0 pair) plus the
-// per-destination lookups that replace the old single-victim globals:
-// node id -> main IPv4 address (t=60 gate, oracle path walk), and
-// flow-destination IP -> destination MAC (PHY-level last-hop delivery
-// detection, see PhyTxBeginCallback Branch B).
+// TRF-001: the per-run selected data flows (node-id pairs; g_flowPairs[0] is
+// ALWAYS the legacy node1 -> node0 pair) plus node id -> main IPv4 address,
+// used by the t=60 acceptance gate and the oracle path walk.
+// SL-3: g_flowDstMacByIp is gone with the last-hop delivery detection.
 static std::vector<std::pair<uint32_t, uint32_t>> g_flowPairs;
 static std::map<uint32_t, Ipv4Address>            g_nodeToIp;
-static std::map<Ipv4Address, Mac48Address>        g_flowDstMacByIp;
-
-// OBS-004 (TRF-002): (src, dst, IP-id) -> on-air observation record. Used
-// to correlate per-packet observations across multiple trace events:
-//   * First observation: source's Ipv4::Tx -- record firstSeenTime,
-//     bytes, src/dst, lastTtl. Counted as "packet sent."
-//   * Subsequent observations: each forwarder's Ipv4::Tx -- update
-//     lastSeenTime, lastTtl, observationCount, capture firstHopMac
-//     from the SECOND observation.
-//   * Delivery: declared in PhyTxBeginCallback when a data frame's
-//     L2 destination MAC equals the MAC of the node owning the frame's
-//     IP destination -- and that destination is one of this run's flow
-//     destinations (i.e., the genuine last-hop transmission). This is
-//     the ONLY reliable observable
-//     delivery signal -- counting observationCount alone would falsely
-//     credit packets the attacker blackholes after one or more relays
-//     pick them up.
-//
-// Map cleared at window-start (ResetOlsrCounters) and window-end
-// (FinalizeInFlightDeliveries). Undelivered IP-ids at window-end stay
-// undelivered -- matching the oracle's accounting.
-struct FirstOnAirRec
-{
-  double       firstSeenTime    = 0.0;
-  double       lastSeenTime     = 0.0;
-  uint32_t     bytes            = 0;
-  Ipv4Address  src;
-  Ipv4Address  dst;
-  Mac48Address firstHopMac;            // L2 src of the SECOND observation
-  uint8_t      lastTtl          = 0;   // (unused for delivery; kept for diagnostics)
-  uint32_t     observationCount = 0;   // (kept for diagnostics)
-};
-// TRF-002: with NUM_DATA_FLOWS concurrent sources the bare IP-id is NOT
-// unique on the medium -- ns-3 assigns the IP Identification per
-// (src,dst,protocol) starting at 0 on EVERY node, so simultaneous flows
-// collide on the 16-bit id alone. The correlation key is therefore the
-// passively observable triple (src, dst, IP-id), all read from the IP
-// header on the air.
-using FlowPacketKey = std::tuple<uint32_t, uint32_t, uint16_t>;
-static inline FlowPacketKey
-MakeFlowPacketKey (Ipv4Address src, Ipv4Address dst, uint16_t ipId)
-{
-  return FlowPacketKey (src.Get (), dst.Get (), ipId);
-}
-static std::map<FlowPacketKey, FirstOnAirRec> g_firstOnAirByFlowIpId;
 
 // RUN-004: staging file paths and persistent counters.
 struct StagingFiles
@@ -771,8 +785,7 @@ static Ptr<olsr::RoutingProtocol> GetOlsrProtocol (Ptr<Node> node);
 static std::vector<uint32_t>      WalkOlsrPath   (NodeContainer& nodes,
                                                   Ipv4Address src,
                                                   Ipv4Address dst);
-static void                       AssertMinHops  (NodeContainer* cont,
-                                                  uint32_t minHops);
+static void                       AssertRouteExists (NodeContainer* cont);
 static void                       CheckAndReportConnectivity (NodeContainer* cont);
 static void                       ResetOlsrCounters ();
 
@@ -782,8 +795,8 @@ static void                       ResetOlsrCounters ();
 // ============================================================================
 static const char* RUNS_HEADER =
   "run_id,rng_run,rng_seed,harness_version,header_version,"
-  "n_nodes,grid_x,grid_y,mobility,radio_range,min_hops_required,"
-  "num_attackers,attackers_list,spoof_count,attacker_jitter,"
+  "n_nodes,grid_x,grid_y,mobility,radio_range,"
+  "num_attackers,attackers_list,spoof_count,attacker_jitter,listener_node,"
   "defense_variant,redundant_mpr,malicious_threshold,uncertainty_beta,"
   "fading_factor,max_load,max_delay,cheat_threshold,"
   "trust_update_interval_s,phy_trace_available,wall_clock_seconds,"
@@ -803,7 +816,7 @@ static const char* ORACLE_HEADER =
   "path_hops_internal,"
   "min_attacker_trust,avg_attacker_trust,blacklist_max_size,"
   "mac_tx_in_window,mac_drop_in_window,mac_tx_total,mac_drop_total,"
-  "true_detections,false_detections,watchdogs_total,watchdogs_in_range,"
+  "true_detections,false_detections,defenders_total,defenders_in_range,"
   "detection_percent,detection_percent_in_range,false_alarm_rate";
 
 // FEATURES_HEADER is built from the identifier prefix + g_features header.
@@ -811,7 +824,7 @@ static std::string BuildFeaturesHeader ()
 {
   std::string h =
     "run_id,scenario,window_start,window_end,window_duration_s,";
-  h += ns3::olsreval::FeatureCollector::FeatureCsvHeader (FEATURE_MODE);
+  h += ns3::olsreval::FeatureCollector::FeatureCsvHeader ();
   return h;
 }
 
@@ -925,25 +938,6 @@ MacTxOracleOnlyCallback (std::string context, Ptr<const Packet> /*packet*/)
   if (nodeId < g_macTxPerNode.size ()) g_macTxPerNode[nodeId]++;
 }
 
-// Called at end of each measurement window to clear in-flight entries.
-// Delivery is now declared at PHY level inside PhyTxBeginCallback (when
-// the L2 destination MAC equals the flow destination's MAC), so the only
-// thing left here is to drop any entries that were sent but never reached
-// their destination --
-// these are the genuinely-undelivered packets (dropped, lost, or still
-// in flight at window end). They contribute to PacketsSentCount but not
-// to PacketsDeliveredCount or to the latency / throughput totals,
-// matching the oracle's accounting.
-//
-// If PHY trace is unavailable, no deliveries get declared at all -- the
-// G-group features degrade gracefully and phy_trace_available=0 in
-// runs.csv records the fact (just like F-group).
-static void
-FinalizeInFlightDeliveries ()
-{
-  g_firstOnAirByFlowIpId.clear ();
-}
-
 // --------- MacTxDrop: oracle-only per-node drop count (OBS-001) -------------
 // We no longer treat MacTxDrop as a "collision" or "unack'd reception"
 // (MIS-002). It is a sender-side pre-air drop. Count for the oracle and stop.
@@ -955,225 +949,84 @@ MacTxDropCallback (std::string context, Ptr<const Packet> packet)
   if (nodeId < g_macDropPerNode.size ()) g_macDropPerNode[nodeId]++;
 }
 
-// --------- PhyTxBegin sniffer: real MAC header (OBS-002b) -------------------
-// At PhyTxBegin the frame has its WifiMacHeader attached. We drop 1-hop
-// RTS/CTS/ACK control frames (OBS-007), HELLO-filter (by parsing the MSDU
-// under the MAC header), then feed F-group features.
+// ============================================================================
+// SL-2/SL-3: the single-listener sniffer -- the ONLY feed of the collector
+// ============================================================================
 //
-// The signature of MonitorSnifferTx / PhyTxBegin has varied across ns-3
-// versions; we connect via a failsafe wrapper that catches and skips on
-// signature mismatch.
+// Connected to Phy/MonitorSnifferRx on g_listenerNodeId alone. That trace
+// fires for every PSDU this one radio successfully RECEIVES, whether or not
+// the frame is addressed to it -- i.e. exactly one card in promiscuous mode.
+// Because it is a receive-side trace, range, collisions and capture effect
+// are decided by the PHY model: a frame this node cannot hear never arrives
+// here, and a listener that the attack or the defense cuts off genuinely
+// stops seeing messages. That is the property the whole schema rests on.
 //
-// Expected ns-3-dev signature (current main): (Ptr<const Packet>, double txPowerW)
-// We use a single-argument variant as a fallback if 2-arg fails.
+// The sniffed packet handed on is the full MPDU:
+//   WifiMacHeader + LlcSnapHeader + IP + UDP + payload + WifiMacTrailer(FCS)
+// The collector bounds its OLSR parsing by the OLSR packetLength field, so it
+// never deserializes FCS or padding bytes.
+//
+// A node never receives its own transmissions, so the listener's own TX is
+// excluded automatically ("the frames it alone receives").
 static void
-PhyTxBeginCallback (std::string context, Ptr<const Packet> packet, double /*txPowerW*/)
+MonitorSnifferRxCallback (Ptr<const Packet> packet,
+                          uint16_t /*channelFreqMhz*/,
+                          WifiTxVector /*txVector*/,
+                          MpduInfo /*aMpdu*/,
+                          SignalNoiseDbm /*signalNoise*/,
+                          uint16_t /*staId*/)
 {
   if (!g_featuresActive) return;
-  if (!g_phyTraceAvailable) return;
-
-  // Peek the WifiMacHeader (now valid at PHY layer).
-  Ptr<Packet> p = packet->Copy ();
-  WifiMacHeader macHdr;
-  if (p->PeekHeader (macHdr) == 0) return;
-  p->RemoveHeader (macHdr);
-
-  // OBS-007: RTS/CTS/ACK are 1-hop MAC control frames with the same
-  // observability limit as HELLO -- a remote passive attacker cannot
-  // reliably sniff them. Drop them BEFORE any feature observation
-  // (mirror of the OBS-001 HELLO filter). See olsr_window_features.h.
-  if (macHdr.IsRts () || macHdr.IsCts () || macHdr.IsAck ()) return;
-
-  const bool isData = macHdr.IsData ();
-  const bool isRetry = macHdr.IsRetry ();
-  const double now = Simulator::Now ().GetSeconds ();
-  const double durSec = macHdr.GetDuration ().GetSeconds ();
-
-  // HELLO filter AND delivery detection. At PHY layer the MSDU layout is:
-  //   WifiMacHeader (already removed above)
-  // + LlcSnapHeader (8 bytes added by WifiNetDevice::Send)
-  // + IP + UDP + payload
-  // + WifiMacTrailer (4-byte FCS, NOT present at IP-layer trace)
-  //
-  // We must (a) skip LLC before parsing IP, (b) bound OLSR parsing by the
-  // packetLength field so we don't deserialize FCS bytes as a fake OLSR
-  // message header (which would trip NS_ASSERT and abort).
-  //
-  // Two purposes here:
-  //   * For OLSR (UDP port 698): filter HELLO out of F-group features.
-  //   * For DATA (UDP port 80): if the L2 dst MAC equals the MAC of the
-  //     node owning the frame's IP destination -- one of this run's flow
-  //     destinations -- this is the genuine LAST-HOP transmission of that
-  //     flow, and we declare delivery for the corresponding
-  //     (src,dst,IP-id) key (TRF-002). This is the ONLY reliable
-  //     delivery signal observable to an eavesdropper -- using
-  //     observationCount alone would falsely count packets the attacker
-  //     blackholes (they accumulate observations at the relays before
-  //     the attacker drops them).
-  if (isData)
-    {
-      Ptr<Packet> msduCopy = packet->Copy ();
-      WifiMacHeader skipMac;
-      msduCopy->RemoveHeader (skipMac);
-      LlcSnapHeader skipLlc;
-      if (msduCopy->GetSize () < skipLlc.GetSerializedSize ())
-        { g_features.ObserveMacFrame (now, durSec, isData, isRetry); return; }
-      msduCopy->RemoveHeader (skipLlc);
-      Ipv4Header ipHdr;
-      if (msduCopy->GetSize () >= ipHdr.GetSerializedSize ())
-        {
-          msduCopy->RemoveHeader (ipHdr);
-          if (ipHdr.GetProtocol () == 17)
-            {
-              UdpHeader udpHdr;
-              if (msduCopy->GetSize () >= udpHdr.GetSerializedSize ())
-                {
-                  msduCopy->RemoveHeader (udpHdr);
-                  const uint16_t dstPort = udpHdr.GetDestinationPort ();
-
-                  // --- Branch A: OLSR (port 698) -- HELLO filter only ---
-                  if (dstPort == 698)
-                    {
-                      olsr::PacketHeader olsrHdr;
-                      const uint32_t olsrHdrSize = olsrHdr.GetSerializedSize ();
-                      if (msduCopy->GetSize () >= olsrHdrSize)
-                        {
-                          msduCopy->RemoveHeader (olsrHdr);
-                          uint32_t remaining = 0;
-                          if (olsrHdr.GetPacketLength () >= olsrHdrSize)
-                            remaining = olsrHdr.GetPacketLength () - olsrHdrSize;
-                          if (remaining > msduCopy->GetSize ())
-                            remaining = msduCopy->GetSize ();
-                          while (remaining >= 12)
-                            {
-                              uint8_t firstByte = 0;
-                              if (msduCopy->CopyData (&firstByte, 1) != 1) break;
-                              if (firstByte < 1 || firstByte > 4) break;
-                              olsr::MessageHeader m;
-                              const uint32_t before = msduCopy->GetSize ();
-                              msduCopy->RemoveHeader (m);
-                              const uint32_t after = msduCopy->GetSize ();
-                              const uint32_t consumed =
-                                  (before >= after) ? (before - after) : 0;
-                              if (consumed == 0 || consumed > remaining) break;
-                              remaining -= consumed;
-                              // FEAT-008: record on-air relay of this TC
-                              // copy (transmitter = MAC Addr2). Feeds the
-                              // schema's group-A suppression features;
-                              // copies are deduplicated by
-                              // (originator, msg-seq) inside the collector.
-                              if (m.GetMessageType ()
-                                  == olsr::MessageHeader::TC_MESSAGE)
-                                {
-                                  g_features.ObserveTcRelayOnAir (
-                                      m.GetOriginatorAddress (),
-                                      m.GetMessageSequenceNumber (),
-                                      m.GetHopCount (),
-                                      macHdr.GetAddr2 ());
-                                }
-                              if (m.GetMessageType ()
-                                  == olsr::MessageHeader::HELLO_MESSAGE)
-                                return;  // skip HELLO from F-group features
-                            }
-                        }
-                    }
-                  // --- Branch B: data to a flow destination (port 80) ---
-                  // Last-hop detection (TRF-002): this transmission is
-                  // addressed at L2 to the MAC of the node that owns the
-                  // frame's IP destination, and that destination is one of
-                  // this run's flow destinations. That makes this the final
-                  // hop; no forwarder will retransmit, the packet has been
-                  // delivered.
-                  else if (dstPort == UDP_PORT && g_featuresActive)
-                    {
-                      // FEAT-008: every observed DATA forward feeds the
-                      // group-B isolation-breadth features (forwarder =
-                      // MAC Addr2, next-hop = MAC Addr1). Reroute detection
-                      // and distinct-pair counting happen in the collector.
-                      g_features.ObserveDataForwardOnAir (
-                          macHdr.GetAddr2 (), macHdr.GetAddr1 (),
-                          ipHdr.GetDestination ());
-                      const auto dstIt =
-                          g_flowDstMacByIp.find (ipHdr.GetDestination ());
-                      if (dstIt != g_flowDstMacByIp.end ()
-                          && macHdr.GetAddr1 () == dstIt->second)
-                        {
-                          const FlowPacketKey key = MakeFlowPacketKey (
-                              ipHdr.GetSource (), ipHdr.GetDestination (),
-                              ipHdr.GetIdentification ());
-                          auto it = g_firstOnAirByFlowIpId.find (key);
-                          if (it != g_firstOnAirByFlowIpId.end ())
-                            {
-                              const double lat = std::max (
-                                  0.0, now - it->second.firstSeenTime);
-                              g_features.ObserveDataDeliveredOnAir (
-                                  it->second.src, it->second.dst,
-                                  ipHdr.GetTtl (), lat,
-                                  it->second.firstHopMac, now);
-                              g_features.AddDeliveredBytes (it->second.bytes);
-                              g_firstOnAirByFlowIpId.erase (it);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-  g_features.ObserveMacFrame (now, durSec, isData, isRetry);
+  // SL-3: hand the raw PSDU straight to the collector. No filtering happens
+  // here -- not RTS/CTS/ACK, not HELLO. The collector parses the frame in the
+  // reference harness's order, so the two implementations cannot drift.
+  g_features.ObserveSniffedFrame (packet);
 }
 
-// Failsafe trace connect. Uses Config::ConnectFailSafe which returns
-// false if no objects match the path (instead of NS_FATAL_ERROR'ing
-// like the regular Config::Connect). Catches std::exception for any
-// other failure mode. On any failure, sets g_phyTraceAvailable=false
-// and the F-group features emit 0.
-//
-// NOTE: a signature mismatch (e.g. PhyTxBegin callback type changed in
-// some future ns-3 version) would manifest as a compile error, not a
-// runtime failure -- the build would fail before we ever get here.
+// SL-3: connect the listener's sniffer. Returns false when there is no
+// listener or the trace source is missing, in which case the collector is
+// never fed and every feature column emits 0.
 static bool
-TryConnectPhyTrace ()
+ConnectListenerSniffer ()
 {
+  if (g_listenerNodeId == LISTENER_NODE_UNSET)
+    {
+      std::cerr << "[listener] no listener node resolved; features will be 0"
+                << std::endl;
+      return false;
+    }
+  std::ostringstream path;
+  path << "/NodeList/" << g_listenerNodeId
+       << "/DeviceList/*/$ns3::WifiNetDevice/Phy/MonitorSnifferRx";
+  bool ok = false;
   try
     {
-      const bool ok = Config::ConnectFailSafe (
-          "/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Phy/PhyTxBegin",
-          MakeCallback (&PhyTxBeginCallback));
-      if (!ok)
-        {
-          std::cerr << "[phy_trace] no matching trace sources for "
-                       "Phy/PhyTxBegin; F-group features will emit 0"
-                    << std::endl;
-        }
-      return ok;
+      ok = Config::ConnectWithoutContextFailSafe (
+          path.str (), MakeCallback (&MonitorSnifferRxCallback));
     }
   catch (std::exception& e)
     {
-      std::cerr << "[phy_trace] connect failed: " << e.what () << std::endl;
+      std::cerr << "[listener] connect failed: " << e.what () << std::endl;
       return false;
     }
   catch (...)
     {
-      std::cerr << "[phy_trace] connect failed: unknown exception" << std::endl;
+      std::cerr << "[listener] connect failed: unknown exception" << std::endl;
       return false;
     }
+  if (!ok)
+    std::cerr << "[listener] no MonitorSnifferRx at " << path.str ()
+              << "; features will be 0" << std::endl;
+  return ok;
 }
 
-// --------- Ipv4 Tx trace: OLSR control parsing AND data observation -------
-// At Ipv4::Tx the packet is the bare IP datagram (no LLC, no MAC header).
-// This trace fires for every IP transmission from this node: originated
-// packets (Send()) AND forwarded packets (IpForward()).
-//
-// We dispatch by UDP destination port:
-//   port 698 -> OLSR control (TC/MID/HNA -> features, HELLO -> oracle)
-//   port 80  -> data packet -> on-air observation ((src,dst,IP-id)
-//               correlation, TRF-002)
-//
-// We pass Ptr<Ipv4> to get the originating node ID (needed for
-// first-hop-MAC tracking via g_nodeToMac).
+// --------- Ipv4 Tx trace: ORACLE ONLY (SL-3) ------------------------------
+// A network-wide transmit-side trace. It feeds windows_oracle.csv and NOTHING
+// else: no feature column may be derived here, because a single listener has
+// no such vantage. Port-80 data traffic is not observed at all any more --
+// under SL-3 the only data-plane vantage is the listener's own sniffer.
 static void
-TraceOlsrPacket (Ptr<const Packet> packet, Ptr<Ipv4> ipv4, uint32_t /*interface*/)
+TraceOlsrPacket (Ptr<const Packet> packet, Ptr<Ipv4> /*ipv4*/, uint32_t /*interface*/)
 {
   Ptr<Packet> pktCopy = packet->Copy ();
   Ipv4Header ipHeader;
@@ -1188,7 +1041,6 @@ TraceOlsrPacket (Ptr<const Packet> packet, Ptr<Ipv4> ipv4, uint32_t /*interface*
   // ===== Branch A: OLSR control traffic (port 698) =========================
   if (dstPort == 698)
     {
-      const Ipv4Address senderIfaceAddr = ipHeader.GetSource ();
       g_olsrControlBytesWithHello += packet->GetSize ();   // oracle only
 
       olsr::PacketHeader olsrHeader;
@@ -1219,27 +1071,20 @@ TraceOlsrPacket (Ptr<const Packet> packet, Ptr<Ipv4> ipv4, uint32_t /*interface*
           if (consumed == 0 || consumed > remaining) break;
           remaining -= consumed;
 
-          const uint32_t msgSize = msg.GetSerializedSize ();
-          const Ipv4Address originator = msg.GetOriginatorAddress ();
           switch (msg.GetMessageType ())
             {
             case olsr::MessageHeader::HELLO_MESSAGE:
-              ++g_helloCount;          // oracle only -- HELLO is non-observable
+              ++g_helloCount;
               break;
             case olsr::MessageHeader::TC_MESSAGE:
               ++g_tcCount;
               g_totalTcRows += msg.GetTc ().neighborAddresses.size ();
-              if (g_featuresActive)
-                g_features.ObserveTc (senderIfaceAddr, originator, msg,
-                                      msg.GetTc (), msgSize);
               break;
             case olsr::MessageHeader::MID_MESSAGE:
               ++g_midCount;
-              if (g_featuresActive) g_features.ObserveMid (originator, msgSize);
               break;
             case olsr::MessageHeader::HNA_MESSAGE:
               ++g_hnaCount;
-              if (g_featuresActive) g_features.ObserveHna (originator, msgSize);
               break;
             default:
               break;
@@ -1248,60 +1093,8 @@ TraceOlsrPacket (Ptr<const Packet> packet, Ptr<Ipv4> ipv4, uint32_t /*interface*
       return;
     }
 
-  // ===== Branch B: UDP data traffic of the measured flows (port 80) ========
-  if (dstPort != UDP_PORT) return;
-  if (!g_featuresActive) return;
-
-  const double      now      = Simulator::Now ().GetSeconds ();
-  const uint16_t    ipId     = ipHeader.GetIdentification ();
-  const Ipv4Address ipSrc    = ipHeader.GetSource ();
-  const Ipv4Address ipDst    = ipHeader.GetDestination ();
-  const uint8_t     ttl      = ipHeader.GetTtl ();
-  const uint32_t    pktBytes = packet->GetSize ();
-
-  // Identify the originating node from Ptr<Ipv4>.
-  uint32_t nodeId = std::numeric_limits<uint32_t>::max ();
-  if (ipv4)
-    {
-      Ptr<Node> node = ipv4->GetObject<Node> ();
-      if (node) nodeId = node->GetId ();
-    }
-
-  const FlowPacketKey key = MakeFlowPacketKey (ipSrc, ipDst, ipId);
-  auto it = g_firstOnAirByFlowIpId.find (key);
-  if (it == g_firstOnAirByFlowIpId.end ())
-    {
-      // First observation = source's Ipv4::Tx (initial TTL=64).
-      FirstOnAirRec rec;
-      rec.firstSeenTime    = now;
-      rec.lastSeenTime     = now;
-      rec.bytes            = pktBytes;
-      rec.src              = ipSrc;
-      rec.dst              = ipDst;
-      rec.firstHopMac      = Mac48Address ();
-      rec.lastTtl          = ttl;
-      rec.observationCount = 1;
-      g_firstOnAirByFlowIpId[key] = rec;
-      g_features.ObserveDataSentOnAir (ipSrc, ipDst, pktBytes, now);
-    }
-  else
-    {
-      // Subsequent observation = a forwarder's Ipv4::Tx.
-      it->second.lastSeenTime = now;
-      it->second.lastTtl      = ttl;
-      it->second.observationCount++;
-      // BUG-004: the SECOND observation (first forwarder) gives the
-      // first-hop MAC. Subsequent observations leave it unchanged.
-      if (it->second.firstHopMac == Mac48Address ()
-          && nodeId != std::numeric_limits<uint32_t>::max ())
-        {
-          auto macIt = g_nodeToMac.find (nodeId);
-          if (macIt != g_nodeToMac.end ())
-            it->second.firstHopMac = macIt->second;
-        }
-      // Delivery is declared at PHY layer (in PhyTxBeginCallback) when the
-      // last-hop transmission addressed to the flow's destination is observed.
-    }
+  // SL-3: Branch B (port-80 on-air observation) removed with the rest of the
+  // network-wide data-plane machinery.
 }
 // ============================================================================
 // Connectivity gates (unchanged)
@@ -1343,17 +1136,17 @@ AssertConnectivity (NodeContainer* cont)
 }
 
 static void
-AssertMinHops (NodeContainer* cont, uint32_t minHops)
+AssertRouteExists (NodeContainer* cont)
 {
   if (g_runRejected) return;
   if (cont->GetN () < 2) return;
-  // TRF-003: the gate now checks EVERY selected flow pair. g_flowPairs[0]
-  // is the legacy node1 -> node0 pair, so its check -- and the
-  // run-acceptance behavior of every previously accepted seed -- is
-  // unchanged; the additional pairs satisfy the geometric >= minHops bound
-  // by construction, so they can only reject here in the (essentially
-  // impossible) selection-fallback case. Rejection reason strings are
-  // UNCHANGED.
+  // TRF-003: the gate checks EVERY selected flow pair. g_flowPairs[0] is the
+  // legacy node1 -> node0 pair.
+  // TRF-006: the minimum-hop-distance requirement is GONE -- the only thing
+  // this gate still rejects is a flow for which OLSR has no route at all
+  // ("no_route_to_victim"). The hop count is measured and logged purely for
+  // the record; it is no longer an acceptance criterion, and the "too_close"
+  // rejection reason no longer exists.
   for (std::size_t f = 0; f < g_flowPairs.size (); ++f)
     {
       const uint32_t srcId = g_flowPairs[f].first;
@@ -1394,21 +1187,9 @@ AssertMinHops (NodeContainer* cont, uint32_t minHops)
           Simulator::Stop ();
           return;
         }
-      if (distance < minHops)
-        {
-          std::cout << "*** Flow " << f << " (" << srcId << " -> " << dstId
-                    << ") too close: " << distance
-                    << " hops, need at least " << minHops << ". Terminated."
-                    << std::endl;
-          g_runRejected = true;
-          g_rejectReason = "too_close";
-          g_rejectedAtSec = Simulator::Now ().GetSeconds ();
-          Simulator::Stop ();
-          return;
-        }
       std::cout << "Distance flow " << f << " (" << srcId << " -> " << dstId
-                << ") at t=60: " << distance << " hops (>= " << minHops
-                << " required). OK." << std::endl;
+                << ") at t=60: " << distance << " hops (no minimum required)."
+                << std::endl;
     }
 }
 
@@ -1623,8 +1404,8 @@ SampleDetectionAccuracy (NodeContainer* nodes,
 {
   g_trueDetections          = 0;
   g_falseDetections         = 0;
-  g_watchdogsTotal          = 0;
-  g_watchdogsInRange        = 0;
+  g_defendersTotal          = 0;
+  g_defendersInRange        = 0;
   g_detectionPercent        = 0.0;
   g_detectionPercentInRange = 0.0;
   g_falseAlarmRate          = 0.0;
@@ -1642,7 +1423,7 @@ SampleDetectionAccuracy (NodeContainer* nodes,
     }
   if (attackerAddrs.empty ()) return;
 
-  uint32_t trueDet = 0, falseDet = 0, wdTotal = 0, wdInRange = 0;
+  uint32_t trueDet = 0, falseDet = 0, defTotal = 0, defInRange = 0;
 
   for (uint32_t i = 0; i < nodes->GetN (); ++i)
     {
@@ -1655,12 +1436,12 @@ SampleDetectionAccuracy (NodeContainer* nodes,
           DynamicCast<olsr::OlsrDefenseStrategy> (pv.Get<olsr::OlsrDefenseStrategy> ());
       if (!def) continue;
 
-      ++wdTotal;
+      ++defTotal;
 
       // Only a one-hop neighbour can overhear a relay, so only such a node had
       // any opportunity to detect. This separates the two denominators.
       for (const auto& nb : proto->GetNeighbors ())
-        if (attackerAddrs.count (nb.neighborMainAddr)) { ++wdInRange; break; }
+        if (attackerAddrs.count (nb.neighborMainAddr)) { ++defInRange; break; }
 
       for (const Ipv4Address& accused : def->GetBlacklist ())
         {
@@ -1671,21 +1452,21 @@ SampleDetectionAccuracy (NodeContainer* nodes,
 
   g_trueDetections   = trueDet;
   g_falseDetections  = falseDet;
-  g_watchdogsTotal   = wdTotal;
-  g_watchdogsInRange = wdInRange;
+  g_defendersTotal   = defTotal;
+  g_defendersInRange = defInRange;
 
   const double noMalicious = static_cast<double> (attackerAddrs.size ());
-  if (wdTotal > 0)
+  if (defTotal > 0)
     {
       g_detectionPercent =
           100.0 * static_cast<double> (trueDet) /
-          (static_cast<double> (wdTotal) * noMalicious);
+          (static_cast<double> (defTotal) * noMalicious);
     }
-  if (wdInRange > 0)
+  if (defInRange > 0)
     {
       g_detectionPercentInRange =
           100.0 * static_cast<double> (trueDet) /
-          (static_cast<double> (wdInRange) * noMalicious);
+          (static_cast<double> (defInRange) * noMalicious);
     }
 
   const uint32_t totalDet = trueDet + falseDet;
@@ -1843,8 +1624,10 @@ static void PrintDefenseStateSizes ();
 // WIN-001: apply the (attack, defense) state required by the scenario assigned
 // to `slot`, toggling only what actually changes from the currently-applied
 // state. Scheduled at each slot transition (t = SlotTransitionTime(slot)).
-// The slot-0 transition fires at t=INITIAL_STABILIZATION, immediately AFTER
-// the acceptance gates (which run in the neutral state) by scheduling order.
+// The slot-0 transition fires at t=g_initialStabilization: t=0 in canonical
+// order (slot 0 is the neutral "baseline" scenario, so the gates still see the
+// neutral state at t=60), and t=60 in mixed order -- there immediately AFTER
+// the acceptance gates by scheduling order (WIN-003).
 static void
 ApplyScenarioState (NodeContainer nodes, std::vector<uint32_t> attackerIds,
                     uint32_t spoofCount, int slot)
@@ -1891,7 +1674,6 @@ ResetOlsrCounters ()
   g_hnaCount                 = 0;
   g_totalTcRows              = 0;
   g_olsrControlBytesWithHello = 0;
-  g_firstOnAirByFlowIpId.clear ();   // OBS-004: bound the latency-correlation map
 }
 
 // WBR-001 (revised): slot-transition cold start of the defense object.
@@ -2065,14 +1847,6 @@ EndMeasurementWindow (const std::string& scenarioName,
   if (g_runRejected) return;
   g_featuresActive = false;
 
-  // Drop any entries still in the in-flight map. Deliveries are declared
-  // at PHY layer (in PhyTxBeginCallback) when the last-hop TX to a flow
-  // destination is observed; anything still in the map at window-end was
-  // sent but never reached its destination (dropped, lost, or in flight at
-  // boundary). They contribute to PacketsSentCount but not
-  // PacketsDeliveredCount -- matching the oracle's accounting.
-  FinalizeInFlightDeliveries ();
-
   const double duration = windowEnd - windowStart;
 
   // ---- Oracle row ----
@@ -2133,7 +1907,7 @@ EndMeasurementWindow (const std::string& scenarioName,
             << macTxInWin << "," << macDropInWin << ","
             << macTxTotal << "," << macDropTotal << ","
             << g_trueDetections << "," << g_falseDetections << ","
-            << g_watchdogsTotal << "," << g_watchdogsInRange << ","
+            << g_defendersTotal << "," << g_defendersInRange << ","
             << g_detectionPercent << "," << g_detectionPercentInRange << ","
             << g_falseAlarmRate << "\n";
   g_staging.oracleRows.push_back (oracleRow.str ());
@@ -2156,7 +1930,7 @@ EndMeasurementWindow (const std::string& scenarioName,
   featRow << g_currentRun << ","
           << scenarioName << ","
           << windowStart << "," << windowEnd << "," << duration << ","
-          << g_features.EmitFeatureCsv (windowEnd, FEATURE_MODE)
+          << g_features.EmitFeatureCsv (windowEnd)
           << "\n";
   g_staging.featureRows.push_back (featRow.str ());
 
@@ -2271,9 +2045,9 @@ PromoteStagedRows (const SimulationConfig& cfg, double wallClockSec)
           << cfg.gridX << "," << cfg.gridY << ","
           << (cfg.bMobility ? 1 : 0) << ","
           << cfg.radioRange << ","
-          << cfg.minHops << ","
           << numAttackers << "," << attackersPipe << ","
           << cfg.spoofCount << "," << cfg.attackerJitter << ","
+          << g_listenerNodeId << ","
           << defenseVariant << "," << -1 << ","  // defense_variant, redundant_mpr (FPNT-only -> sentinel -1)
           << -1 << ","                            // malicious_threshold      (FPNT-only -> sentinel -1)
           << -1 << ","                            // uncertainty_beta         (FPNT-only -> sentinel -1)
@@ -2431,72 +2205,69 @@ EmitHeadersAndExit ()
 }
 
 // ============================================================================
-// --self-test mode (BUG-007 cycle counter verification)
+// --self-test mode (SL-3: feature-schema verification)
+//
+// The cycle-counter self-test went with the A-L schema. What is worth
+// asserting now is that the emitted schema is exactly the 17 LISTENER columns
+// and that header and row stay in lock-step -- the failure mode that would
+// silently corrupt a whole dataset.
 // ============================================================================
 static int
 RunSelfTest ()
 {
+  using ns3::olsreval::FeatureCollector;
   bool allPass = true;
-  auto check = [&] (const std::string& name,
-                    const std::vector<std::vector<uint32_t>>& adj,
-                    uint64_t exp3, uint64_t exp4,
-                    uint64_t exp5, uint64_t exp6) {
-    using ns3::olsreval::FeatureCollector;
-    uint64_t c3 = FeatureCollector::TestCountCyclesOfLength (adj, 3);
-    uint64_t c4 = FeatureCollector::TestCountCyclesOfLength (adj, 4);
-    uint64_t c5 = FeatureCollector::TestCountCyclesOfLength (adj, 5);
-    uint64_t c6 = FeatureCollector::TestCountCyclesOfLength (adj, 6);
-    bool ok = (c3 == exp3 && c4 == exp4 && c5 == exp5 && c6 == exp6);
-    std::cout << name << ":  triangles=" << c3
-              << " 4-cycles=" << c4
-              << " 5-cycles=" << c5
-              << " 6-cycles=" << c6
-              << "   [exp " << exp3 << "/" << exp4 << "/" << exp5 << "/" << exp6
-              << "] " << (ok ? "OK" : "FAIL") << std::endl;
+
+  auto check = [&] (const std::string& name, bool ok, const std::string& detail) {
+    std::cout << name << ": " << (ok ? "OK" : "FAIL");
+    if (!detail.empty ()) std::cout << "   [" << detail << "]";
+    std::cout << std::endl;
     if (!ok) allPass = false;
   };
-  // K3
+
+  auto countFields = [] (const std::string& csv) -> std::size_t {
+    if (csv.empty ()) return 0;
+    std::size_t n = 1;
+    for (char c : csv) if (c == ',') ++n;
+    return n;
+  };
+
+  const std::string hdr  = FeatureCollector::FeatureCsvHeader ();
+  const std::size_t nHdr = countFields (hdr);
   {
-    std::vector<std::vector<uint32_t>> a (3);
-    a[0] = {1,2}; a[1] = {0,2}; a[2] = {0,1};
-    check ("K3   ", a, 1, 0, 0, 0);
+    std::ostringstream d; d << nHdr << " columns";
+    check ("header width ", nHdr == FeatureCollector::kNumFeatures, d.str ());
   }
-  // K4
+
+  // An untouched collector over a 40 s window: the row must be the same width
+  // as the header and must contain no nan/inf.
+  FeatureCollector fc;
+  fc.Reset (0.0);
+  const std::string emptyRow = fc.EmitFeatureCsv (40.0);
   {
-    std::vector<std::vector<uint32_t>> a (4);
-    a[0] = {1,2,3}; a[1] = {0,2,3}; a[2] = {0,1,3}; a[3] = {0,1,2};
-    // K4: triangles = C(4,3) = 4; 4-cycles = 3 (each pair of opposite
-    // edges); 5-cycles = 0; 6-cycles = 0.
-    check ("K4   ", a, 4, 3, 0, 0);
+    std::ostringstream d; d << countFields (emptyRow) << " fields";
+    check ("row width    ", countFields (emptyRow) == nHdr, d.str ());
   }
-  // C6 (single cycle on 6 vertices)
+
+  bool finite = true;
   {
-    std::vector<std::vector<uint32_t>> a (6);
-    for (uint32_t i = 0; i < 6; ++i)
-      {
-        a[i].push_back ((i + 5) % 6);
-        a[i].push_back ((i + 1) % 6);
-        std::sort (a[i].begin (), a[i].end ());
-      }
-    check ("C6   ", a, 0, 0, 0, 1);
+    std::stringstream ss (emptyRow);
+    std::string tok;
+    while (std::getline (ss, tok, ','))
+      if (tok.find ("nan") != std::string::npos
+          || tok.find ("inf") != std::string::npos)
+        { finite = false; break; }
   }
-  // K3,3 (complete bipartite 3x3)
-  {
-    std::vector<std::vector<uint32_t>> a (6);
-    // partition: {0,1,2} on one side, {3,4,5} on the other; all cross-edges.
-    for (uint32_t i = 0; i < 3; ++i)
-      for (uint32_t j = 3; j < 6; ++j)
-        { a[i].push_back (j); a[j].push_back (i); }
-    for (auto& nb : a)
-      { std::sort (nb.begin (), nb.end ());
-        nb.erase (std::unique (nb.begin (), nb.end ()), nb.end ()); }
-    // K3,3: triangles = 0 (bipartite). 4-cycles = C(3,2)*C(3,2) = 9.
-    // 6-cycles = 3! * 3! / (2*6) = 36/12 = 3 ... actually:
-    //   Number of Hamiltonian 6-cycles in K3,3 = 6 (canonical form).
-    //   This is well-known. Use 6.
-    // 5-cycles in bipartite graph = 0.
-    check ("K3,3 ", a, 0, 9, 0, 6);
-  }
+  check ("empty window ", finite, "no nan/inf on an unfed collector");
+
+  // Emitting must be pure: the same window emitted twice gives the same row.
+  check ("emit is pure ", fc.EmitFeatureCsv (40.0) == emptyRow, "");
+
+  // Reset must clear: a fresh window starts from the same state.
+  fc.Reset (100.0);
+  check ("reset clears ", fc.EmitFeatureCsv (140.0) == emptyRow, "");
+
+  std::cout << "\nheader: " << hdr << std::endl;
   std::cout << (allPass ? "ALL PASS" : "FAILURES PRESENT") << std::endl;
   return allPass ? 0 : 1;
 }
@@ -2523,8 +2294,8 @@ main (int argc, char* argv[])
   cmd.AddValue ("maliciousNodes",  "Comma-separated malicious node IDs",cfg.maliciousNodesList);
   cmd.AddValue ("spoofCount",      "Spoofed links per attacker",        cfg.spoofCount);
   cmd.AddValue ("attackerJitter",  "Random offset (m) around centre",   cfg.attackerJitter);
-  cmd.AddValue ("minHops",         "Min OLSR hops from src to dst @ t=60",
-                                                                       cfg.minHops);
+  cmd.AddValue ("listenerNode",    "SL-2 single-listener node id "
+                                   "(-1 = first attacker)", cfg.listenerNode);
   cmd.AddValue ("redundantMpr",        "Inert in Watchdog build (CLI compat)", cfg.redundantMpr);
   cmd.AddValue ("maliciousThreshold",  "FPNT-only; inert in this build", cfg.maliciousThreshold);
   cmd.AddValue ("uncertaintyBeta",     "FPNT-only; inert in this build", cfg.uncertaintyBeta);
@@ -2582,6 +2353,14 @@ main (int argc, char* argv[])
   if (g_randomWindowOrder)
     DeterministicShuffle (g_scenarioOrder, cfg.run);
 
+  // WIN-003: the 60 s neutral prologue is needed ONLY for the mixed window
+  // order (slot 0 may then carry attack and/or defense). Canonical order runs
+  // the plain 4 x 100 s = 400 s timeline, because its slot 0 IS the neutral
+  // "baseline" scenario. Must be fixed HERE -- before any slot time is
+  // computed or any event scheduled.
+  g_initialStabilization =
+      g_randomWindowOrder ? MIXED_INITIAL_STABILIZATION : 0.0;
+
   CreateOutputDirectories (cfg);
   WriteDefenseParamsOnce (cfg);   // GEN-004: provenance sidecar (write-once)
   // ----- 1. Nodes & WiFi ---------------------------------------------------
@@ -2618,7 +2397,7 @@ main (int argc, char* argv[])
 
   NetDeviceContainer devices = wifi.Install (phy, mac, nodes);
 
-  // Build node -> MAC map for first-hop-MAC tracking (BUG-004).
+  // Node -> MAC map. SL-3: diagnostics only; nothing derives a feature from it.
   g_nodeToMac.clear ();
   for (uint32_t i = 0; i < devices.GetN (); ++i)
     {
@@ -2649,6 +2428,21 @@ main (int argc, char* argv[])
       }
   }
   const std::set<uint32_t> attackerSet (attackerIds.begin (), attackerIds.end ());
+
+  // ----- SL-2: resolve the single listener --------------------------------
+  // Its radio is the ONLY feed of the feature collector. The default is the
+  // first attacker id, so the listener is the adversarial vantage the schema
+  // describes; --listenerNode overrides it with any node.
+  if (cfg.listenerNode >= 0)
+    g_listenerNodeId = static_cast<uint32_t> (cfg.listenerNode);
+  else if (!attackerIds.empty ())
+    g_listenerNodeId = attackerIds.front ();
+  else
+    g_listenerNodeId = LISTENER_NODE_UNSET;
+  NS_ABORT_MSG_IF (g_listenerNodeId != LISTENER_NODE_UNSET
+                     && g_listenerNodeId >= cfg.nNodes,
+                   "listener node " << g_listenerNodeId
+                   << " is out of range for nNodes=" << cfg.nNodes);
 
   // ----- 3. Mobility -------------------------------------------------------
   {
@@ -2773,17 +2567,7 @@ main (int argc, char* argv[])
   // pure, portable function of (seed, run) and reproduce bit-identically on
   // any standard library -- the same guarantee as the WIN-001 window shuffle.
   const uint32_t pairSeed = cfg.seed * 2654435761u + cfg.run;
-  g_flowPairs = SelectDataFlowPairs (nodes, attackerSet, cfg.minHops,
-                                     cfg.radioRange, pairSeed);
-
-  // TRF-002: flow-destination IP -> destination MAC (PHY last-hop delivery).
-  g_flowDstMacByIp.clear ();
-  for (const auto& fp : g_flowPairs)
-    {
-      const auto macIt = g_nodeToMac.find (fp.second);
-      if (macIt != g_nodeToMac.end ())
-        g_flowDstMacByIp[interfaces.GetAddress (fp.second)] = macIt->second;
-    }
+  g_flowPairs = SelectDataFlowPairs (nodes, attackerSet, pairSeed);
 
   // ----- 6. Per-flow UDP servers and per-window clients (TRF-001) ----------
   // One UdpServer per flow destination (endpoints are disjoint across flows,
@@ -2798,7 +2582,7 @@ main (int argc, char* argv[])
       ApplicationContainer serverApp =
           serverHelper.Install (nodes.Get (fp.second));
       serverApp.Start (Seconds (0.0));
-      serverApp.Stop  (Seconds (SIMULATION_TAIL));
+      serverApp.Stop  (Seconds (SimulationTail ()));
       Ptr<UdpServer> srv = DynamicCast<UdpServer> (serverApp.Get (0));
       NS_ASSERT_MSG (srv, "Failed to retrieve UdpServer instance for flow dst "
                      << fp.second);
@@ -2843,36 +2627,43 @@ main (int argc, char* argv[])
   for (int slot = 0; slot < NUM_SLOTS; ++slot)
     installWindow (SlotWindowStart (slot), SlotWindowEnd (slot));
 
-  Simulator::Schedule (Seconds (SIMULATION_END - 1.0), &ReportNumReceivedPackets);
+  Simulator::Schedule (Seconds (SimulationEnd () - 1.0),
+                       &ReportNumReceivedPackets);
 
   // ----- 7. FlowMonitor + per-slot scheduling (WIN-002) --------------------
   g_flowMonitor = g_flowHelper.InstallAll ();
 
-  // Scheduling order at t = INITIAL_STABILIZATION (60 s) matters. ns-3 fires
+  // Scheduling order at t = ACCEPTANCE_GATE_TIME (60 s) matters. ns-3 fires
   // same-timestamp events in insertion order, so we schedule:
   //   (1) the topology probe at t=59 (strictly before the gates),
-  //   (2) the acceptance gates at t=60 -- they run in the NEUTRAL state
-  //       because slot 0's scenario state is applied only afterwards,
-  //   (3) the per-slot scenario-state transitions (slot 0 also at t=60,
-  //       inserted AFTER the gates so the gates see the neutral state),
-  //   (4) the per-slot measurement brackets.
+  //   (2) the acceptance gates at t=60. They run in the NEUTRAL state in BOTH
+  //       window orders: with the mixed order the whole [0,60) prologue is
+  //       neutral and slot 0's scenario state is applied only afterwards;
+  //       with the canonical order slot 0 IS "baseline" (attack OFF, defense
+  //       OFF) and was applied at t=0, so t=60 is neutral there as well,
+  //   (3) the per-slot scenario-state transitions -- inserted AFTER the gates
+  //       so that a slot 0 transition landing on t=60 (mixed order) still
+  //       sees the neutral state,
+  //   (4) the per-slot measurement brackets -- also after the gates, so that
+  //       slot 0's window opening at t=60 (canonical order) is short-circuited
+  //       by a rejection.
 
   // (1) Topology probe (before the gates).
-  Simulator::Schedule (Seconds (59.0),
+  Simulator::Schedule (Seconds (ACCEPTANCE_GATE_TIME - 1.0),
                        &RecordTopologyProbe, &nodes, cfg.radioRange);
 
   // (2) Acceptance gates in the neutral (attack OFF, defense OFF) state.
   //     A rejection here short-circuits every later handler.
-  Simulator::Schedule (Seconds (INITIAL_STABILIZATION),
+  Simulator::Schedule (Seconds (ACCEPTANCE_GATE_TIME),
                        &AssertConnectivity, &nodes);
-  Simulator::Schedule (Seconds (INITIAL_STABILIZATION),
-                       &AssertMinHops, &nodes, cfg.minHops);
-  Simulator::Schedule (Seconds (INITIAL_STABILIZATION),
+  Simulator::Schedule (Seconds (ACCEPTANCE_GATE_TIME),
+                       &AssertRouteExists, &nodes);
+  Simulator::Schedule (Seconds (ACCEPTANCE_GATE_TIME),
                        &CheckAndReportConnectivity, &nodes);
 
-  // (3) Per-slot scenario-state transitions. Slot 0 transitions at t=60
-  //     (immediately AFTER the gates by insertion order); subsequent slots
-  //     at 60 + k*SLOT_DURATION.
+  // (3) Per-slot scenario-state transitions, at
+  //     g_initialStabilization + k*SLOT_DURATION (so slot 0 fires at t=0 in
+  //     canonical order and at t=60 in mixed order).
   for (int slot = 0; slot < NUM_SLOTS; ++slot)
     Simulator::Schedule (Seconds (SlotTransitionTime (slot)),
                          &ApplyScenarioState, nodes, attackerIds,
@@ -2898,17 +2689,18 @@ main (int argc, char* argv[])
   // MacTxDrop feeds oracle-only per-node drop counts.
   Config::Connect ("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/MacTxDrop",
                    MakeCallback (&MacTxDropCallback));
-  // OBS-002b: PHY-trace failsafe connect.
-  g_phyTraceAvailable = TryConnectPhyTrace ();
-  g_features.SetPhyAvailable (g_phyTraceAvailable);
-  if (!g_phyTraceAvailable)
-    std::cout << "[phy_trace] unavailable; F-group features will be 0"
-              << std::endl;
+  // SL-3: the single listener's receive-side sniffer is the ONLY feed of the
+  // feature collector. The TX-side PhyTxBegin trace is gone entirely.
+  g_phyTraceAvailable = ConnectListenerSniffer ();
+  if (g_phyTraceAvailable)
+    std::cout << "[listener] single-listener sniffer attached to node "
+              << g_listenerNodeId << std::endl;
+  else
+    std::cout << "[listener] unavailable; features will be 0" << std::endl;
 
-  // IPv4::Tx feeds both OLSR control parsing (port 698) AND data-packet
-  // on-air observation (port 80) — see TraceOlsrPacket for the dispatch.
-  // At this trace point the packet is the bare IP datagram (no LLC, no
-  // MAC header), which is the right layer for both purposes.
+  // IPv4::Tx feeds the ORACLE counters only (SL-3). At this trace point the
+  // packet is the bare IP datagram, which is the right layer for counting
+  // control messages network-wide.
   for (uint32_t i = 0; i < nodes.GetN (); ++i)
     {
       Ptr<Ipv4> ipv4Node = nodes.Get (i)->GetObject<Ipv4> ();
@@ -2918,7 +2710,7 @@ main (int argc, char* argv[])
   // ----- 9. Run -----------------------------------------------------------
   PrintSimStats (cfg, attackerIds);
 
-  Simulator::Stop (Seconds (SIMULATION_TAIL));
+  Simulator::Stop (Seconds (SimulationTail ()));
   Simulator::Run ();
   Simulator::Destroy ();
 
