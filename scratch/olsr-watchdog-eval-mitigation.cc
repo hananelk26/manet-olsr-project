@@ -2249,16 +2249,43 @@ RunSelfTest ()
     check ("row width    ", countFields (emptyRow) == nHdr, d.str ());
   }
 
-  bool finite = true;
+  // An unfed collector heard no IPv4 frame, so feature 8
+  // (NormalizedRoutingLoad) is genuinely UNDEFINED and must emit NaN -- that
+  // is the corrected arm_spec.py behaviour, not a defect. Every OTHER column
+  // must still be finite. Asserting both directions is the point: a NaN that
+  // wandered into another column, or a 0.0 filled into column 8, would each
+  // be a real bug.
+  const std::size_t kNrlIndex = 7;          // 0-based: 8th of the 17
+  bool othersFinite = true, nrlIsNan = false;
   {
     std::stringstream ss (emptyRow);
     std::string tok;
+    std::size_t idx = 0;
     while (std::getline (ss, tok, ','))
-      if (tok.find ("nan") != std::string::npos
-          || tok.find ("inf") != std::string::npos)
-        { finite = false; break; }
+      {
+        const bool bad = tok.find ("nan") != std::string::npos
+                      || tok.find ("inf") != std::string::npos;
+        if (idx == kNrlIndex) nrlIsNan = bad;
+        else if (bad)         othersFinite = false;
+        ++idx;
+      }
   }
-  check ("empty window ", finite, "no nan/inf on an unfed collector");
+  check ("empty window ", othersFinite, "16 columns finite on an unfed collector");
+  check ("nrl undefined", nrlIsNan, "NormalizedRoutingLoad is NaN when nothing was heard");
+
+  // And the header name at that index must really be the column we exempted.
+  {
+    std::stringstream hs (hdr);
+    std::string name;
+    std::size_t idx = 0, hit = std::string::npos;
+    while (std::getline (hs, name, ','))
+      {
+        if (name == "NormalizedRoutingLoad") hit = idx;
+        ++idx;
+      }
+    check ("nrl position ", hit == kNrlIndex,
+           "NormalizedRoutingLoad is column 8");
+  }
 
   // Emitting must be pure: the same window emitted twice gives the same row.
   check ("emit is pure ", fc.EmitFeatureCsv (40.0) == emptyRow, "");

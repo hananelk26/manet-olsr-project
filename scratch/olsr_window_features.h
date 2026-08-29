@@ -31,7 +31,7 @@
 //
 //   Load & overhead
 //     7  RoutingOverheadBytesRatio           olsrBytes / dataBytes
-//     8  NormalizedRoutingLoad               olsrFrames / (dataFrames - olsrFrames)
+//     8  NormalizedRoutingLoad               olsrFrames / dataFrames
 //
 //   Data plane
 //     9  DataPacketRate                      frames / Duration
@@ -78,7 +78,19 @@
 //       TC. advByOriginator[orig] is overwritten on every TC, then summed at
 //       emit time.
 //
-// ONE OPEN DECISION -- see kNrlUndefinedValue below (feature 8 denominator).
+//   (g) FEATURE 8 IS A SHARE, NOT A RATIO. arm_spec.py was corrected on
+//       28/8/2026: NormalizedRoutingLoad is now ObsOlsrFrames/SniffedDataFrames
+//       -- OLSR frames as a fraction of ALL IPv4-carrying frames heard -- and
+//       NOT the old ObsOlsrFrames/ObsNonOlsrDataFrames. The old denominator
+//       (dataFrames - olsrFrames) is zero whenever the vantage point heard no
+//       non-OLSR data frame, which the reference measured at 64.3% of static
+//       and 51.1% of mobile observer rows; the pipeline caught the
+//       ZeroDivisionError and stored 0.0, so "all control, no data" (an
+//       effectively infinite ratio) became indistinguishable from its exact
+//       opposite. The share form is bounded in [0,1] and strictly monotone in
+//       the old ratio (s = r/(1+r)), so the ordering of every previously
+//       defined row is preserved and the collapsed rows now take 1.0.
+//       Undefined only when the listener heard nothing at all.
 // ---------------------------------------------------------------------------
 
 #include "ns3/core-module.h"
@@ -94,6 +106,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
@@ -128,22 +141,17 @@ class FeatureCollector
 public:
   static constexpr uint32_t kNumFeatures = 17;
 
-  // OPEN DECISION (feature 8). NormalizedRoutingLoad divides by
-  // (dataFrames - olsrFrames), the count of non-OLSR IPv4 frames heard. A
-  // listener that overheard no application traffic in the window -- which is
-  // the COMMON case when the harness runs a single low-rate UDP pair -- makes
-  // that denominator zero.
+  // Feature 8 is undefined only when the listener heard no IPv4-carrying frame
+  // at all in the window. arm_spec.py's _eval_obs was corrected on 28/8/2026 to
+  // return NaN there rather than 0.0, precisely because 0.0 is a legal value of
+  // the metric and an undefined quantity must not be storable as a measured
+  // one. We match that: NaN, never a filled-in number.
   //
-  // The reference does not resolve this: SaveObserverMetrics writes
-  // ObsNonOlsrDataFrames to the CSV and the division happens later in
-  // arm_spec.py. Until we know what arm_spec.py does with a zero denominator,
-  // we emit the value below and keep the choice in one place.
-  //
-  // Emitting 0.0 conflates "heard no data traffic" with "heard no OLSR", which
-  // are very different states. If arm_spec.py instead produces NaN/inf and
-  // those rows are dropped downstream, change this constant and add a row
-  // filter rather than silently mapping both states onto zero.
-  static constexpr double kNrlUndefinedValue = 0.0;
+  // These rows are meant to be DROPPED in analysis, not imputed. The reference
+  // measured them at 0.000% of static and 0.068% of mobile observer rows.
+  // HeardAnyIpFrame() below lets the caller count them without parsing the CSV.
+  static constexpr double kNrlUndefinedValue =
+      std::numeric_limits<double>::quiet_NaN ();
 
   void Reset (double tStart)
   {
@@ -383,13 +391,15 @@ public:
            / static_cast<double> (m_dataBytes))
         : 0.0;
 
-    // === 8. Observable NRL surrogate ======================================
-    const uint64_t nonOlsrDataFrames =
-        (m_dataFrames >= m_olsrFrames) ? (m_dataFrames - m_olsrFrames) : 0;
+    // === 8. Observable NRL, SHARE form (arm_spec.py, corrected 28/8/2026) ==
+    // ObsOlsrFrames / SniffedDataFrames. m_dataFrames IS SniffedDataFrames:
+    // every IPv4-carrying frame heard, OLSR included, so olsrFrames is a subset
+    // of it and the result is bounded in [0,1]. Zero only when no IPv4 frame
+    // was heard at all -- see kNrlUndefinedValue.
     const double normalizedRoutingLoad =
-        (nonOlsrDataFrames > 0)
+        (m_dataFrames > 0)
         ? (static_cast<double> (m_olsrFrames)
-           / static_cast<double> (nonOlsrDataFrames))
+           / static_cast<double> (m_dataFrames))
         : kNrlUndefinedValue;
 
     // === 9. All sniffed frames per second (SniffedFrameRate) ==============
@@ -464,13 +474,15 @@ public:
   // ----------------------- Introspection hooks ----------------------------
   // For sanity-checking a window before writing it. A window with almost no
   // observations emits a row of near-zeros that reads like a quiet network.
-  // HeardNonOlsrDataFrames() == 0 is exactly the case where feature 8 falls
-  // back to kNrlUndefinedValue.
+  // HeardAnyIpFrame() == false is exactly the case where feature 8 emits NaN
+  // and the row should be dropped in analysis.
   uint64_t SniffedFrames ()          const { return m_frames; }
   uint64_t HeardTcCopies ()          const { return m_tcCount; }
   uint64_t HeardUniqueTcs ()         const { return m_tcUniqueCount; }
   uint64_t HeardHellos ()            const { return m_helloCount; }
   uint64_t PerceivedSources ()       const { return m_bytesBySource.size (); }
+  bool     HeardAnyIpFrame ()        const { return m_dataFrames > 0; }
+  uint64_t HeardIpFrames ()          const { return m_dataFrames; }
   uint64_t HeardNonOlsrDataFrames () const
   { return (m_dataFrames >= m_olsrFrames) ? (m_dataFrames - m_olsrFrames) : 0; }
 
